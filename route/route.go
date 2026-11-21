@@ -44,6 +44,12 @@ type LinkMeas struct {
 	LossPPM uint32
 	At      int64  // the receive time, monotonic ms; 0: none
 	From    NodeID // the reporting node
+	// ProbeAt and ProbeRTTus are a round-trip observation with queueing,
+	// separate from the cost estimate. ProbeAt uses the same clock as
+	// Inputs.Now and stays fixed on refresh. Zero RTT at a nonzero
+	// ProbeAt records a failed probe.
+	ProbeAt    int64
+	ProbeRTTus uint32
 	// Carrier names the transport the measurement used ("" unknown);
 	// diagnostics only, never a cost input.
 	Carrier string
@@ -299,6 +305,9 @@ type PathSet struct {
 	Via   []NodeID
 	Allow []NodeID
 	Paths []Path
+	// PreferFirst applies the first path to all flow classes after a
+	// failure, until an ordinary cost-based switch replaces it.
+	PreferFirst bool
 	// Why says why each path holds its place (diagnostics):
 	// "shortest", "diverse shared=N", "kept: …".
 	Why []string
@@ -319,24 +328,26 @@ type PathTable struct {
 	// compares against them).
 	Used map[Edge]EdgeState
 	// Pending are the switches waiting out the hysteresis by (src,
-	// demand key): a cheaper first path and since when it has been
-	// (Topo.Switch.Hold measurement periods).
+	// demand key): either a cheaper path or the path that failed.
 	Pending map[string]Pending
 	// Recheck is the earliest time (ms) a pending switch is due; 0: none.
 	// The caller recomputes then.
 	Recheck int64
 }
 
-// Pending is a first path waiting to replace the current one.
+// Pending is a first path waiting to replace the current one. Since is
+// when it became cheaper, or when the failed path was last seen down.
 type Pending struct {
-	Hops  []NodeID
-	Since int64
+	Hops     []NodeID
+	Since    int64
+	recovery *recovery
 }
 
 // EdgeState is an edge as one computation saw it.
 type EdgeState struct {
-	Cost   uint64
-	Usable bool
+	Cost      uint64
+	Usable    bool
+	Available bool // the latest fresh report says Up
 }
 
 // Set returns src's set for (dst, via) without an Allow limit.
@@ -371,17 +382,23 @@ func cmpSet(a, b PathSet) int {
 // the cheaper of its two directions (Link). known is false when no side
 // is fresh (the edge is not in the graph).
 func EdgeCost(in Inputs, e Edge) (cost uint64, usable, known bool) {
-	ab, ok, known := in.Link(e.A, e.B)
-	if !ok {
-		return 0, false, known
+	state, known := in.edgeState(e)
+	return state.Cost, state.Usable, known
+}
+
+func (in Inputs) edgeState(e Edge) (EdgeState, bool) {
+	ab, up, lossDown, known := in.link(e.A, e.B)
+	if !up || lossDown {
+		return EdgeState{Available: up}, known
 	}
-	ba, _, _ := in.Link(e.B, e.A)
-	return min(pathcost.Edge(ab, pathcost.Interactive), pathcost.Edge(ba, pathcost.Interactive)), true, true
+	ba, _, _, _ := in.link(e.B, e.A)
+	cost := min(pathcost.Edge(ab, pathcost.Interactive), pathcost.Edge(ba, pathcost.Interactive))
+	return EdgeState{Cost: cost, Usable: true, Available: true}, true
 }
 
 // Link is the edge from→to as the cost model takes it, with its
-// usability: the fresher of the two fresh sides decides Up (loss ≥
-// pathcost.LossDown is down); RTT, loss and queueing delay are the larger fresh
+// usability: the fresher of the two fresh sides decides Up and whether
+// loss reaches LossDown. RTT, loss and queueing delay are the larger fresh
 // ones; the rate from→to is the smaller known of from's outbound and to's
 // inbound report; the fee is paid at both ends — from's uplink for the
 // bytes it sends plus to's for the bytes it receives, each end's uplink
@@ -389,18 +406,23 @@ func EdgeCost(in Inputs, e Edge) (cost uint64, usable, known bool) {
 // dialling end; an exhausted pair quota exhausts it; the bias is the
 // pair's plus to's. known is false when no side is fresh.
 func (in Inputs) Link(from, to NodeID) (l pathcost.Link, usable, known bool) {
+	l, up, lossDown, known := in.link(from, to)
+	return l, up && !lossDown, known
+}
+
+func (in Inputs) link(from, to NodeID) (l pathcost.Link, up, lossDown, known bool) {
 	t := in.Topo
 	e := MakeEdge(from, to)
 	if t.Cover[e].Mode == LinkForbid {
-		return l, false, true
+		return l, false, false, true
 	}
 	a, ok := t.Nodes[from]
 	if !ok || !a.Active {
-		return l, false, true
+		return l, false, false, true
 	}
 	b, ok := t.Nodes[to]
 	if !ok || !b.Active {
-		return l, false, true
+		return l, false, false, true
 	}
 	sides := in.Links[e]
 	fresh := func(m LinkMeas) bool { return m.At != 0 && in.Now-m.At <= 3*t.KeepaliveMS() }
@@ -435,10 +457,10 @@ func (in Inputs) Link(from, to NodeID) (l pathcost.Link, usable, known bool) {
 		}
 	}
 	if side == nil {
-		return l, false, false
+		return l, false, false, false
 	}
-	if !side.Up || side.LossPPM >= pathcost.LossDown {
-		return l, false, true
+	if !side.Up {
+		return l, false, false, true
 	}
 	if len(rates) > 0 {
 		l.RateBps = slices.Min(rates)
@@ -448,13 +470,7 @@ func (in Inputs) Link(from, to NodeID) (l pathcost.Link, usable, known bool) {
 		l.Fee.Exhausted = true // the pair's quota is spent
 	}
 	l.BiasUs = t.Cover[e].BiasUs + b.BiasUs
-	return l, true, true
-}
-
-// edgeInfo is an edge in the graph of one computation.
-type edgeInfo struct {
-	cost   uint64
-	usable bool
+	return l, true, side.LossPPM >= pathcost.LossDown, true
 }
 
 // graph is the usable edges of one computation by endpoint, and the
@@ -462,14 +478,14 @@ type edgeInfo struct {
 type graph struct {
 	in    Inputs
 	adj   map[NodeID][]NodeID // ascending neighbours over usable edges
-	edges map[Edge]edgeInfo
+	edges map[Edge]EdgeState
 	links map[[2]NodeID]pathcost.Link
 	// allow is the route.nodes of the demand being computed (nil: none).
 	allow []NodeID
 }
 
 func buildGraph(in Inputs) *graph {
-	g := &graph{in: in, adj: map[NodeID][]NodeID{}, edges: map[Edge]edgeInfo{}, links: map[[2]NodeID]pathcost.Link{}}
+	g := &graph{in: in, adj: map[NodeID][]NodeID{}, edges: map[Edge]EdgeState{}, links: map[[2]NodeID]pathcost.Link{}}
 	for e := range in.Links {
 		g.addEdge(e)
 	}
@@ -487,22 +503,15 @@ func (g *graph) addEdge(e Edge) {
 	if _, ok := g.edges[e]; ok {
 		return
 	}
-	cost, usable, known := EdgeCost(g.in, e)
-	g.edges[e] = edgeInfo{cost: cost, usable: usable && known}
-	if usable && known {
+	state, _ := g.in.edgeState(e)
+	g.edges[e] = state
+	if state.Usable {
 		g.adj[e.A] = append(g.adj[e.A], e.B)
 		g.adj[e.B] = append(g.adj[e.B], e.A)
 	}
 }
 
-func (g *graph) usable(e Edge) bool {
-	i, ok := g.edges[e]
-	if !ok {
-		_, usable, known := EdgeCost(g.in, e)
-		return usable && known
-	}
-	return i.usable
-}
+func (g *graph) usable(e Edge) bool { return g.edges[e].Usable }
 
 // link is the directed link from→to (cached).
 func (g *graph) link(from, to NodeID) pathcost.Link {
@@ -510,7 +519,7 @@ func (g *graph) link(from, to NodeID) pathcost.Link {
 	if l, ok := g.links[k]; ok {
 		return l
 	}
-	l, _, _ := g.in.Link(from, to)
+	l, _, _, _ := g.in.link(from, to)
 	g.links[k] = l
 	return l
 }
@@ -539,28 +548,45 @@ func (g *graph) pathCost(src NodeID, p []NodeID, c pathcost.Class) uint64 {
 	return pathcost.Path(g.pathLinks(src, p), c)
 }
 
-// pathUsable reports p from src usable in g, with its current
-// interactive cost.
-func (g *graph) pathUsable(src NodeID, p []NodeID, via []NodeID) (uint64, bool) {
-	if len(p) == 0 || len(p) > g.in.Topo.MaxHops {
-		return 0, false
+// pathAllowed checks the constraints shared by selection and recovery.
+func (g *graph) pathAllowed(src NodeID, p []NodeID, via []NodeID) bool {
+	if len(p) == 0 || len(p) > g.in.Topo.MaxHops || !g.allowed(src) || !g.in.Topo.Nodes[src].Active {
+		return false
 	}
 	prev := src
 	hit := len(via) == 0 || slices.Contains(via, src)
 	for i, n := range p {
-		if !g.allowed(n) {
-			return 0, false
+		if !g.allowed(n) || !g.in.Topo.Nodes[n].Active || i < len(p)-1 && !g.transit(n) {
+			return false
 		}
-		if i < len(p)-1 && !g.transit(n) {
-			return 0, false
-		}
-		if !g.usable(MakeEdge(prev, n)) {
-			return 0, false
+		if g.in.Topo.Cover[MakeEdge(prev, n)].Mode == LinkForbid {
+			return false
 		}
 		hit = hit || slices.Contains(via, n)
 		prev = n
 	}
-	return g.pathCost(src, p, pathcost.Interactive), hit
+	return hit
+}
+
+// pathUp can use explicit availability when comparing recovered paths.
+func (g *graph) pathUp(src NodeID, p []NodeID, availabilityOnly bool) bool {
+	for _, n := range p {
+		edge := g.edges[MakeEdge(src, n)]
+		if !edge.Usable && !(availabilityOnly && edge.Available) {
+			return false
+		}
+		src = n
+	}
+	return true
+}
+
+// pathUsable reports p from src usable in g, with its current
+// interactive cost.
+func (g *graph) pathUsable(src NodeID, p []NodeID, via []NodeID) (uint64, bool) {
+	if !g.pathAllowed(src, p, via) || !g.pathUp(src, p, false) {
+		return 0, false
+	}
+	return g.pathCost(src, p, pathcost.Interactive), true
 }
 
 func (g *graph) transit(n NodeID) bool {

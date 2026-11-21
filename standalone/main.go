@@ -205,6 +205,10 @@ func apply(lt route.LinkTable, ls []LinkJSON, now int64) []route.Edge {
 		}
 		m := route.LinkMeas{Up: !l.Down, RTTus: uint32(l.RTTms * 1000), LossPPM: uint32(l.LossPct * 10_000),
 			QueueUs: uint32(l.QueueMs * 1000), NoDatagram: l.NoDatagram, At: now}
+		m.ProbeAt = now
+		if m.Up && m.RTTus != 0 {
+			m.ProbeRTTus = uint32(min(uint64(m.RTTus)+uint64(m.QueueUs), 1<<32-1))
+		}
 		rate := uint64(l.RateMbps * 1e6 / 8)
 		var s [2]route.LinkMeas
 		for i, from := range []int64{e.A, e.B} {

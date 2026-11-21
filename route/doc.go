@@ -13,7 +13,10 @@
 // Recheck time while a switch waits out its hysteresis. A first path
 // changes only once a candidate is cheaper by Topo.Switch.GainPct for
 // Topo.Switch.Hold measurement periods (at once when the old one is
-// unusable); smaller cost moves keep a set as it was.
+// unusable); smaller cost moves keep a set as it was. A path lost to
+// an outage stays a recovery candidate. While a fallback is up,
+// returning to the failed path requires the configured gain in probed
+// RTT over the same number of consecutive fresh rounds.
 //
 // Compute also yields the probe lists: which node measures which peer,
 // relays included when a demand pair is down, one relay per pair in turn

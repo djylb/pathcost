@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"container/heap"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 
@@ -188,49 +189,73 @@ func (g *graph) viaOK(src, dst NodeID, via []NodeID) ([]NodeID, bool) {
 // or full is set (a structural change), else only the demands whose
 // paths cross a changed edge or that end on a changed edge's node;
 // the others keep prev's sets. A new first path replaces the old one
-// only if 10 % cheaper or the old is unusable; cost moves below 20 %
-// keep the set unchanged. It returns the sources whose sets or probe
-// list changed.
+// after the cost hysteresis or if the old is unusable. A first
+// path lost to an outage waits for fresh RTT evidence before returning.
+// It returns the sources whose sets or probe list changed.
 func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]struct{}) {
 	in.Topo.Norm()
 	g := buildGraph(in)
 	if prev == nil {
 		full = true
 	}
-	touched := map[NodeID]bool{}
-	for e := range in.Changed {
-		touched[e.A], touched[e.B] = true, true
+	out := &PathTable{BySrc: map[NodeID][]PathSet{}, Used: g.edges, Pending: map[string]Pending{}}
+	changed := in.Changed
+	if !full {
+		// A report can expire without a new input from the caller.
+		copied := false
+		for ed, state := range prev.Used {
+			if next := out.Used[ed]; state.Usable && !next.Usable || state.Available != next.Available {
+				if _, ok := changed[ed]; ok {
+					continue
+				}
+				if !copied {
+					changed = make(map[Edge]struct{}, len(in.Changed)+1)
+					maps.Copy(changed, in.Changed)
+					copied = true
+				}
+				changed[ed] = struct{}{}
+			}
+		}
 	}
-	out := &PathTable{BySrc: map[NodeID][]PathSet{}, Used: map[Edge]EdgeState{}, Pending: map[string]Pending{}}
-	for e, i := range g.edges {
-		out.Used[e] = EdgeState{Cost: i.cost, Usable: i.usable}
+	touched := map[NodeID]bool{}
+	for e := range changed {
+		touched[e.A], touched[e.B] = true, true
 	}
 	for _, d := range in.Topo.Demand {
 		var old *PathSet
 		if ps, ok := prev.SetOf(d); ok {
 			old = &ps
 		}
-		key := strconv.FormatInt(d.Src, 10) + ":" + d.Key()
+		key := switchKey(d)
 		p, waiting := prev.pending(key)
-		due := waiting && in.Now >= p.Since+in.Topo.holdMS()
-		if !full && !due && !touched[d.Src] && !touched[d.Dst] && (old == nil || !crosses(d.Src, old, in.Changed)) {
+		recovering := p.recovery != nil
+		due := waiting && !recovering && in.Now >= p.Since+in.Topo.holdMS()
+		rebuild := full || due || touched[d.Src] || touched[d.Dst] ||
+			old != nil && crosses(d.Src, old, changed) || recovering && crossesPath(d.Src, p.Hops, changed)
+		if !rebuild && !recovering {
 			if old != nil {
 				out.BySrc[d.Src] = append(out.BySrc[d.Src], *old)
 			}
 			if waiting {
-				out.Pending[key] = p
-				if at := p.Since + in.Topo.holdMS(); out.Recheck == 0 || at < out.Recheck {
-					out.Recheck = at
-				}
+				out.wait(key, p, in.Topo.holdMS())
 			}
 			continue
 		}
-		if waiting {
-			out.Pending[key] = p // pathSet keeps it while the switch still waits
+		g.allow = d.Allow
+		via, allowed := g.viaOK(d.Src, d.Dst, d.Via)
+		if !allowed || !g.allowed(d.Src) || !g.allowed(d.Dst) {
+			continue
 		}
-		ps := g.pathSet(d, old, out.Pending, &out.Recheck)
-		if p, ok := out.Pending[key]; ok && (len(ps.Paths) == 0 || slices.Equal(ps.Paths[0].Hops, p.Hops) || !stillPending(g, d, old, p)) {
-			delete(out.Pending, key) // switched, or no longer cheaper
+		var ps PathSet
+		if ps, p, recovering = g.recover(d, via, old, p, rebuild); recovering {
+			if p.recovery != nil {
+				out.Pending[key] = p
+			}
+		} else {
+			ps, p = g.pathSet(d, via, old, p)
+			if len(p.Hops) > 0 {
+				out.wait(key, p, in.Topo.holdMS())
+			}
 		}
 		if len(ps.Paths) > 0 {
 			out.BySrc[d.Src] = append(out.BySrc[d.Src], ps)
@@ -240,7 +265,7 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 	if prev != nil {
 		bad = prev.BadSince
 	}
-	out.Probe, out.BadSince = g.probe(bad)
+	out.Probe, out.BadSince = g.probe(bad, out)
 	dirty := map[NodeID]struct{}{}
 	if prev == nil {
 		for s := range out.BySrc {
@@ -282,79 +307,80 @@ func (t *PathTable) pending(key string) (Pending, bool) {
 	return p, ok
 }
 
-// stillPending reports that p is still a cheaper first than old's first.
-func stillPending(g *graph, d Demand, old *PathSet, p Pending) bool {
-	if old == nil || len(old.Paths) == 0 {
-		return false
+func switchKey(d Demand) string { return strconv.FormatInt(d.Src, 10) + ":" + d.Key() }
+
+func (t *PathTable) wait(key string, p Pending, hold int64) {
+	t.Pending[key] = p
+	if at := p.Since + hold; t.Recheck == 0 || at < t.Recheck {
+		t.Recheck = at
 	}
-	g.allow = d.Allow
-	via, _ := g.viaOK(d.Src, d.Dst, d.Via)
-	oc, ok := g.pathUsable(d.Src, old.Paths[0].Hops, via)
-	nc, nok := g.pathUsable(d.Src, p.Hops, via)
-	return ok && nok && g.in.Topo.Switch.Better(nc, oc)
 }
 
 // crosses reports a path of ps over a changed edge.
 func crosses(src NodeID, ps *PathSet, changed map[Edge]struct{}) bool {
-	for _, p := range ps.Paths {
-		for _, e := range edgesOf(src, p.Hops) {
-			if _, ok := changed[e]; ok {
-				return true
-			}
+	return slices.ContainsFunc(ps.Paths, func(p Path) bool { return crossesPath(src, p.Hops, changed) })
+}
+
+func crossesPath(src NodeID, hops []NodeID, changed map[Edge]struct{}) bool {
+	for _, n := range hops {
+		if _, ok := changed[MakeEdge(src, n)]; ok {
+			return true
 		}
+		src = n
 	}
 	return false
 }
 
 // sameSet compares the sent part of two sets (hops, costs, via).
 func sameSet(a, b PathSet) bool {
-	return a.Dst == b.Dst && slices.Equal(a.Via, b.Via) && slices.EqualFunc(a.Paths, b.Paths, func(x, y Path) bool {
+	return a.Dst == b.Dst && a.PreferFirst == b.PreferFirst && slices.Equal(a.Via, b.Via) && slices.Equal(a.Allow, b.Allow) && slices.EqualFunc(a.Paths, b.Paths, func(x, y Path) bool {
 		return x.CostUs == y.CostUs && x.BulkCostUs == y.BulkCostUs && x.RtCostUs == y.RtCostUs && slices.Equal(x.Hops, y.Hops)
 	})
 }
 
-// pathSet is the candidates of d with the hysteresis against old
-// (Topo.Switch): a cheaper first path takes
-// the first place only once it has been cheaper by Topo.Switch.GainPct
-// for Topo.Switch.Hold probe intervals (pend holds the wait), or at
-// once when the old first is unusable; whatever the kind of path
-// (direct, relay), and only new flows follow.
-func (g *graph) pathSet(d Demand, old *PathSet, pend map[string]Pending, next *int64) PathSet {
-	ps := PathSet{Dst: d.Dst, Via: d.Via, Allow: d.Allow}
-	key := strconv.FormatInt(d.Src, 10) + ":" + d.Key()
-	g.allow = d.Allow // Allow prunes the graph for this demand
-	via, ok := g.viaOK(d.Src, d.Dst, d.Via)
-	if !ok || !g.allowed(d.Src) || !g.allowed(d.Dst) {
-		return ps
+func (g *graph) candidates(d Demand, via []NodeID) PathSet {
+	paths, why := g.cands(d.Src, d.Dst, via)
+	return PathSet{Dst: d.Dst, Via: d.Via, Allow: d.Allow, Paths: paths, Why: why}
+}
+
+// pathSet applies the cost hysteresis to ordinary path changes.
+func (g *graph) pathSet(d Demand, via []NodeID, old *PathSet, p Pending) (PathSet, Pending) {
+	ps := g.candidates(d, via)
+	if old == nil {
+		return ps, Pending{}
 	}
-	ps.Paths, ps.Why = g.cands(d.Src, d.Dst, via)
-	if old == nil || len(old.Paths) == 0 || len(ps.Paths) == 0 {
-		return ps
+	current := old.Paths[0].Hops
+	oc, ok := g.pathUsable(d.Src, current, via)
+	if !ok {
+		if !old.PreferFirst || !g.pathAllowed(d.Src, current, via) || !g.pathUp(d.Src, current, true) {
+			return g.settle(ps, old), Pending{}
+		}
+		oc = g.pathCost(d.Src, current, pathcost.Interactive)
 	}
-	oc, ok := g.pathUsable(d.Src, old.Paths[0].Hops, via)
-	if !ok || slices.Equal(old.Paths[0].Hops, ps.Paths[0].Hops) {
-		return g.settle(ps, old)
+	if len(ps.Paths) == 0 {
+		g.prefer(&ps, d.Src, current, "kept: previous path still available")
+		return g.settle(ps, old), Pending{}
 	}
+	if slices.Equal(current, ps.Paths[0].Hops) {
+		ps.PreferFirst = old.PreferFirst
+		return g.settle(ps, old), Pending{}
+	}
+	var pending Pending
 	if g.in.Topo.Switch.Better(ps.Paths[0].CostUs, oc) {
-		hold := g.in.Topo.holdMS()
-		p, waiting := pend[key]
-		if !waiting || !slices.Equal(p.Hops, ps.Paths[0].Hops) {
+		if !slices.Equal(p.Hops, ps.Paths[0].Hops) {
 			p = Pending{Hops: ps.Paths[0].Hops, Since: g.in.Now}
 		}
-		if g.in.Now-p.Since >= hold {
+		if g.in.Now-p.Since >= g.in.Topo.holdMS() {
 			ps.Why[0] = fmt.Sprintf("shortest: %d%% cheaper than the previous first for %d ms", 100-ps.Paths[0].CostUs*100/max(oc, 1), g.in.Now-p.Since)
-			return g.settle(ps, old)
+			return g.settle(ps, old), Pending{}
 		}
-		pend[key] = p
-		if at := p.Since + hold; *next == 0 || at < *next {
-			*next = at
-		}
+		pending = p
 	}
 	// Keep the old order (each cost refreshed), drop the old paths gone
 	// unusable, fill up with the new candidates.
-	kept := PathSet{Dst: d.Dst, Via: d.Via, Allow: d.Allow}
+	kept := PathSet{Dst: d.Dst, Via: d.Via, Allow: d.Allow, PreferFirst: old.PreferFirst}
 	for i, p := range old.Paths {
-		if _, ok := g.pathUsable(d.Src, p.Hops, via); ok {
+		if g.pathAllowed(d.Src, p.Hops, via) && g.pathUp(d.Src, p.Hops, i == 0 && old.PreferFirst) {
 			kept.Paths = append(kept.Paths, *g.costed(d.Src, p.Hops))
 			w := "kept: previous order"
 			if i == 0 {
@@ -372,14 +398,14 @@ func (g *graph) pathSet(d Demand, old *PathSet, pend map[string]Pending, next *i
 			kept.Why = append(kept.Why, ps.Why[i])
 		}
 	}
-	return g.settle(kept, old)
+	return g.settle(kept, old), pending
 }
 
 // settle returns old itself (unchanged) when ps has its hops in order
 // and every cost within Topo.Switch.PushPct of old's (smaller cost
 // changes do not change a set).
 func (g *graph) settle(ps PathSet, old *PathSet) PathSet {
-	if len(ps.Paths) != len(old.Paths) {
+	if ps.PreferFirst != old.PreferFirst || len(ps.Paths) != len(old.Paths) {
 		return ps
 	}
 	for i, p := range ps.Paths {
@@ -404,7 +430,7 @@ const relayWindow = 10
 // a via node, the must links; a demand pair not usable for one probe
 // interval adds pairs over up to relay_probe transit nodes (lowest load
 // first). A pair wanted both ways is probed by the lower id only.
-func (g *graph) probe(prevBad map[Edge]int64) (map[NodeID][]NodeID, map[Edge]int64) {
+func (g *graph) probe(prevBad map[Edge]int64, paths *PathTable) (map[NodeID][]NodeID, map[Edge]int64) {
 	t := g.in.Topo
 	want := map[[2]NodeID]bool{}
 	add := func(a, b NodeID) {
@@ -479,6 +505,25 @@ func (g *graph) probe(prevBad map[Edge]int64) (map[NodeID][]NodeID, map[Edge]int
 			}
 			add(s, r.ID)
 			add(r.ID, d)
+		}
+	}
+	// Every hop of both paths needs comparable RTT while recovering.
+	// Keep these pairs in the list even when ordinary relay probes rotate.
+	for _, d := range t.Demand {
+		p := paths.Pending[switchKey(d)]
+		if p.recovery == nil {
+			continue
+		}
+		addPath := func(hops []NodeID) {
+			src := d.Src
+			for _, n := range hops {
+				add(src, n)
+				src = n
+			}
+		}
+		addPath(p.Hops)
+		if ps, ok := paths.SetOf(d); ok {
+			addPath(ps.Paths[0].Hops)
 		}
 	}
 	out := map[NodeID][]NodeID{}

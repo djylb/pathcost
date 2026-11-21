@@ -32,7 +32,12 @@ pt, changed := route.Compute(route.Inputs{Topo: t, Links: links, Now: nowMS}, pr
 Every input is injected: the topology, both ends' link reports and the
 time. `Compute` is pure; the caller keeps the previous table, passes the
 edges that changed (`route.ChangedEdge`), and recomputes at
-`PathTable.Recheck` while a switch waits out its hysteresis.
+`PathTable.Recheck` while a cost-based switch waits out its hysteresis.
+For recovery from an outage, pass comparable per-link round trips with
+`LinkMeas.ProbeRTTus` and `LinkMeas.ProbeAt` and recompute when they
+change. Each round needs a new observation for every hop on both paths.
+`PathSet.PreferFirst` carries the recovery decision to consumers that
+order candidates by flow class.
 
 ## Simulator
 
