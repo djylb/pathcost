@@ -1,0 +1,407 @@
+package main
+
+import (
+	"bufio"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"os"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/djylb/pathcost"
+	"github.com/djylb/pathcost/probe"
+	"github.com/djylb/pathcost/route"
+)
+
+func main() {
+	if err := run(os.Args[1:], os.Stdin, os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, "standalone:", err)
+		os.Exit(1)
+	}
+}
+
+// Scenario is the input file.
+type Scenario struct {
+	// Lambda weighs unit prices (0: pathcost.LambdaBalanced).
+	Lambda          uint64       `json:"lambda,omitempty"`
+	MaxHops         int          `json:"max_hops,omitempty"`
+	Candidates      int          `json:"candidates,omitempty"`
+	ProbeIntervalMS int64        `json:"probe_interval_ms,omitempty"`
+	Switch          SwitchJSON   `json:"switch,omitzero"`
+	Nodes           []NodeJSON   `json:"nodes"`
+	Pairs           []PairJSON   `json:"pairs,omitempty"`
+	Links           []LinkJSON   `json:"links"`
+	Demand          []DemandJSON `json:"demand,omitempty"` // none: every ordered pair
+	Steps           []StepJSON   `json:"steps,omitempty"`
+}
+
+// SwitchJSON is pathcost.Hysteresis (0: defaults).
+type SwitchJSON struct {
+	GainPct uint64 `json:"gain_pct,omitempty"`
+	Hold    uint64 `json:"hold,omitempty"`
+	PushPct uint64 `json:"push_pct,omitempty"`
+}
+
+// NodeJSON is one node; every node is active.
+type NodeJSON struct {
+	ID         int64  `json:"id"`
+	NoTransit  bool   `json:"no_transit,omitempty"`
+	BiasUs     int64  `json:"bias_us,omitempty"`
+	PriceIn    uint64 `json:"price_in,omitempty"`  // unit price per GiB received
+	PriceOut   uint64 `json:"price_out,omitempty"` // unit price per GiB sent
+	QuotaUsed  uint64 `json:"quota_used,omitempty"`
+	Quota      uint64 `json:"quota,omitempty"`       // bytes per period; 0 none
+	ElapsedPPM uint32 `json:"elapsed_ppm,omitempty"` // share of the period gone
+}
+
+// PairJSON is a node pair override.
+type PairJSON struct {
+	A         int64  `json:"a"`
+	B         int64  `json:"b"`
+	Mode      string `json:"mode,omitempty"` // auto, must, forbid
+	BiasUs    int64  `json:"bias_us,omitempty"`
+	Exhausted bool   `json:"exhausted,omitempty"`
+}
+
+// LinkJSON is a measurement of a→b (both directions unless one_way).
+type LinkJSON struct {
+	A          int64   `json:"a"`
+	B          int64   `json:"b"`
+	Down       bool    `json:"down,omitempty"`
+	RTTms      float64 `json:"rtt_ms"`
+	LossPct    float64 `json:"loss_pct,omitempty"`
+	RateMbps   float64 `json:"rate_mbps,omitempty"`
+	QueueMs    float64 `json:"queue_ms,omitempty"`
+	NoDatagram bool    `json:"no_datagram,omitempty"`
+	Remove     bool    `json:"remove,omitempty"`
+}
+
+// DemandJSON is one demand.
+type DemandJSON struct {
+	Src   int64   `json:"src"`
+	Dst   int64   `json:"dst"`
+	Via   []int64 `json:"via,omitempty"`
+	Allow []int64 `json:"allow,omitempty"`
+}
+
+// StepJSON changes measurements at a time (ms from the start).
+type StepJSON struct {
+	AtMS  int64      `json:"at_ms"`
+	Links []LinkJSON `json:"links"`
+}
+
+func run(args []string, stdin io.Reader, stdout io.Writer) error {
+	fs := flag.NewFlagSet("standalone", flag.ContinueOnError)
+	fs.SetOutput(stdout)
+	asJSON := fs.Bool("json", false, "print JSON lines instead of text")
+	replay := fs.Bool("replay", false, "replay a probe trace instead of a scenario")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 1 {
+		return errors.New("usage: standalone [-json] scenario.json | -replay trace.txt (\"-\": stdin)")
+	}
+	in := stdin
+	if p := fs.Arg(0); p != "-" {
+		f, err := os.Open(p)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = f.Close() }()
+		in = f
+	}
+	if *replay {
+		return replayTrace(in, stdout)
+	}
+	var sc Scenario
+	dec := json.NewDecoder(in)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&sc); err != nil {
+		return fmt.Errorf("scenario: %w", err)
+	}
+	return simulate(&sc, stdout, *asJSON)
+}
+
+// Topo is the route topology of sc.
+func (sc *Scenario) Topo() (*route.Topo, error) {
+	t := &route.Topo{Nodes: map[route.NodeID]route.Node{}, Cover: map[route.Edge]route.Cover{},
+		MaxHops: sc.MaxHops, Candidates: sc.Candidates, ProbeIntervalMS: sc.ProbeIntervalMS,
+		Switch: pathcost.Hysteresis{GainPct: sc.Switch.GainPct, Hold: sc.Switch.Hold, PushPct: sc.Switch.PushPct}}
+	for _, n := range sc.Nodes {
+		if _, dup := t.Nodes[n.ID]; dup {
+			return nil, fmt.Errorf("node %d twice", n.ID)
+		}
+		x := route.Node{ID: n.ID, Active: true, Transit: !n.NoTransit, BiasUs: n.BiasUs}
+		scar, ex := pathcost.Progress(n.QuotaUsed, n.Quota, n.ElapsedPPM)
+		if n.PriceIn != 0 || n.PriceOut != 0 || scar != 0 || ex {
+			x.Fees = map[string]route.UplinkFee{"": {In: pathcost.FeeOf(sc.Lambda, n.PriceIn, scar, ex), Out: pathcost.FeeOf(sc.Lambda, n.PriceOut, scar, ex)}}
+		}
+		t.Nodes[n.ID] = x
+	}
+	for _, p := range sc.Pairs {
+		e := route.MakeEdge(p.A, p.B)
+		var m route.LinkMode
+		switch p.Mode {
+		case "", "auto":
+		case "must":
+			m = route.LinkMust
+		case "forbid":
+			m = route.LinkForbid
+		default:
+			return nil, fmt.Errorf("pair %v: mode %q", e, p.Mode)
+		}
+		if m != route.LinkAuto || p.BiasUs != 0 {
+			t.Cover[e] = route.Cover{Mode: m, BiasUs: p.BiasUs}
+		}
+		if p.Exhausted {
+			if t.Exhausted == nil {
+				t.Exhausted = map[route.Edge]struct{}{}
+			}
+			t.Exhausted[e] = struct{}{}
+		}
+	}
+	var ds []route.Demand
+	for _, d := range sc.Demand {
+		ds = append(ds, route.Demand{Src: d.Src, Dst: d.Dst, Via: sorted(d.Via), Allow: sorted(d.Allow)})
+	}
+	if len(sc.Demand) == 0 {
+		for _, a := range sc.Nodes {
+			for _, b := range sc.Nodes {
+				if a.ID != b.ID {
+					ds = append(ds, route.Demand{Src: a.ID, Dst: b.ID})
+				}
+			}
+		}
+	}
+	t.Demand = route.SortDemand(ds)
+	t.Norm()
+	return t, nil
+}
+
+func sorted(s []int64) []int64 {
+	if s == nil {
+		return nil
+	}
+	s = slices.Clone(s)
+	slices.Sort(s)
+	return slices.Compact(s)
+}
+
+// apply puts the measurements ls into lt at now (ms), both ends
+// reporting, and returns the edges touched.
+func apply(lt route.LinkTable, ls []LinkJSON, now int64) []route.Edge {
+	var out []route.Edge
+	for _, l := range ls {
+		e := route.MakeEdge(l.A, l.B)
+		out = append(out, e)
+		if l.Remove {
+			delete(lt, e)
+			continue
+		}
+		m := route.LinkMeas{Up: !l.Down, RTTus: uint32(l.RTTms * 1000), LossPPM: uint32(l.LossPct * 10_000),
+			QueueUs: uint32(l.QueueMs * 1000), NoDatagram: l.NoDatagram, At: now}
+		rate := uint64(l.RateMbps * 1e6 / 8)
+		var s [2]route.LinkMeas
+		for i, from := range []int64{e.A, e.B} {
+			x := m
+			x.From = from
+			x.RateOutBps, x.RateInBps = rate, rate
+			s[i] = x
+		}
+		lt[e] = s
+	}
+	return out
+}
+
+// event is one line of the output.
+type event struct {
+	AtMS  int64          `json:"at_ms"`
+	Kind  string         `json:"kind"` // paths, switch
+	Src   int64          `json:"src"`
+	Dst   int64          `json:"dst"`
+	Via   []int64        `json:"via,omitempty"`
+	Paths []pathJSON     `json:"paths,omitempty"`
+	From  []route.NodeID `json:"from,omitempty"`
+	To    []route.NodeID `json:"to,omitempty"`
+}
+
+type pathJSON struct {
+	Hops   []route.NodeID `json:"hops"`
+	CostUs uint64         `json:"cost_us"`
+	BulkUs uint64         `json:"bulk_us"`
+	RtUs   uint64         `json:"realtime_us"`
+	Why    string         `json:"why"`
+}
+
+// simulate runs the scenario: the initial computation, then each step and
+// the hysteresis rechecks due before the next step (and after the last,
+// within 2 × the hold).
+func simulate(sc *Scenario, w io.Writer, asJSON bool) error {
+	tp, err := sc.Topo()
+	if err != nil {
+		return err
+	}
+	slices.SortStableFunc(sc.Steps, func(a, b StepJSON) int { return int(a.AtMS - b.AtMS) })
+	const start = 1 // ms; 0 is "no report"
+	lt := route.LinkTable{}
+	apply(lt, sc.Links, start)
+	keep := 3 * tp.KeepaliveMS()
+	var prev *route.PathTable
+	out := bufio.NewWriter(w)
+	defer func() { _ = out.Flush() }()
+	emit := func(e event) error {
+		if asJSON {
+			b, err := json.Marshal(e)
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintf(out, "%s\n", b)
+			return err
+		}
+		return printText(out, e)
+	}
+	step := func(now int64, changed map[route.Edge]struct{}, all bool) error {
+		// refresh every report: the scenario's measurements hold until changed
+		for e, s := range lt {
+			for i := range s {
+				if s[i].At != 0 && now-s[i].At > keep/2 {
+					s[i].At = now
+				}
+			}
+			lt[e] = s
+		}
+		pt, _ := route.Compute(route.Inputs{Topo: tp, Links: lt, Now: now, Changed: changed}, prev, prev == nil)
+		for _, d := range tp.Demand {
+			ps, _ := pt.SetOf(d)
+			old, _ := prev.SetOf(d)
+			if prev != nil && first(old) != nil && first(ps) != nil && !slices.Equal(first(old), first(ps)) {
+				if err := emit(event{AtMS: now, Kind: "switch", Src: d.Src, Dst: d.Dst, Via: d.Via, From: first(old), To: first(ps)}); err != nil {
+					return err
+				}
+			}
+			if all || prev == nil || !sameSet(old, ps) {
+				e := event{AtMS: now, Kind: "paths", Src: d.Src, Dst: d.Dst, Via: d.Via, Paths: []pathJSON{}}
+				for i, p := range ps.Paths {
+					why := ""
+					if i < len(ps.Why) {
+						why = ps.Why[i]
+					}
+					e.Paths = append(e.Paths, pathJSON{Hops: p.Hops, CostUs: p.CostUs, BulkUs: p.BulkCostUs, RtUs: p.RtCostUs, Why: why})
+				}
+				if err := emit(e); err != nil {
+					return err
+				}
+			}
+		}
+		prev = pt
+		return nil
+	}
+	if err := step(start, nil, true); err != nil {
+		return err
+	}
+	recheck := func(until int64) error {
+		for prev.Recheck != 0 && prev.Recheck <= until {
+			if err := step(prev.Recheck, map[route.Edge]struct{}{}, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, s := range sc.Steps {
+		at := start + s.AtMS
+		if err := recheck(at); err != nil {
+			return err
+		}
+		changed := map[route.Edge]struct{}{}
+		for _, e := range apply(lt, s.Links, at) {
+			changed[e] = struct{}{}
+		}
+		if err := step(at, changed, false); err != nil {
+			return err
+		}
+	}
+	return recheck(prev.Recheck)
+}
+
+func first(ps route.PathSet) []route.NodeID {
+	if len(ps.Paths) == 0 {
+		return nil
+	}
+	return ps.Paths[0].Hops
+}
+
+func sameSet(a, b route.PathSet) bool {
+	return slices.EqualFunc(a.Paths, b.Paths, func(x, y route.Path) bool {
+		return slices.Equal(x.Hops, y.Hops) && x.CostUs == y.CostUs && x.BulkCostUs == y.BulkCostUs && x.RtCostUs == y.RtCostUs
+	})
+}
+
+func printText(w io.Writer, e event) error {
+	via := ""
+	if len(e.Via) > 0 {
+		via = fmt.Sprintf(" via %v", e.Via)
+	}
+	if e.Kind == "switch" {
+		_, err := fmt.Fprintf(w, "%8d ms  switch %d→%d%s: %v → %v\n", e.AtMS, e.Src, e.Dst, via, e.From, e.To)
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "%8d ms  %d→%d%s:\n", e.AtMS, e.Src, e.Dst, via); err != nil {
+		return err
+	}
+	if len(e.Paths) == 0 {
+		_, err := fmt.Fprintln(w, "             no path")
+		return err
+	}
+	for _, p := range e.Paths {
+		if _, err := fmt.Fprintf(w, "             %v  interactive %d us  bulk %d us  realtime %d us  (%s)\n", p.Hops, p.CostUs, p.BulkUs, p.RtUs, p.Why); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// replayTrace feeds probe outcomes (lines "<ms> <rtt_ms>" or "<ms> lost";
+// "#" comments) through a probe.Estimator and prints the estimate after
+// each, with the interactive cost of the link alone.
+func replayTrace(in io.Reader, w io.Writer) error {
+	var e probe.Estimator
+	sc := bufio.NewScanner(in)
+	out := bufio.NewWriter(w)
+	defer func() { _ = out.Flush() }()
+	for n := 1; sc.Scan(); n++ {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) != 2 {
+			return fmt.Errorf("trace line %d: want <ms> <rtt_ms>|lost", n)
+		}
+		at, err := strconv.ParseInt(f[0], 10, 64)
+		if err != nil {
+			return fmt.Errorf("trace line %d: %w", n, err)
+		}
+		if f[1] == "lost" {
+			e.Lost()
+		} else {
+			ms, err := strconv.ParseFloat(f[1], 64)
+			if err != nil || ms < 0 {
+				return fmt.Errorf("trace line %d: bad rtt %q", n, f[1])
+			}
+			e.Probe(time.Duration(ms * float64(time.Millisecond)))
+		}
+		cost := uint64(0)
+		if e.Up() {
+			cost = pathcost.Edge(e.Link(), pathcost.Interactive)
+		}
+		if _, err := fmt.Fprintf(out, "%8d ms  up=%t rtt=%d us loss=%d ppm miss=%d cost=%d us\n", at, e.Up(), e.RTTus(), e.LossPPM(), e.Miss(), cost); err != nil {
+			return err
+		}
+	}
+	return sc.Err()
+}

@@ -1,0 +1,15 @@
+{
+  "probe_interval_ms": 1000,
+  "candidates": 2,
+  "nodes": [{"id": 1}, {"id": 2}, {"id": 3}],
+  "links": [
+    {"a": 1, "b": 3, "rtt_ms": 10},
+    {"a": 1, "b": 2, "rtt_ms": 6},
+    {"a": 2, "b": 3, "rtt_ms": 6}
+  ],
+  "demand": [{"src": 1, "dst": 3}],
+  "steps": [
+    {"at_ms": 5000, "links": [{"a": 1, "b": 3, "rtt_ms": 30}]},
+    {"at_ms": 20000, "links": [{"a": 1, "b": 3, "rtt_ms": 10}]}
+  ]
+}
