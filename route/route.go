@@ -178,9 +178,11 @@ type Topo struct {
 	Nodes  map[NodeID]Node
 	Cover  map[Edge]Cover
 	Demand []Demand // sorted by (Src, Dst, Via, Allow), unique (SortDemand)
-	// MaxHops bounds the edges of a path, Candidates the paths per
-	// demand; RelayProbe is how many relays an unusable demand pair is
-	// probed over; ProbeIntervalMS is the measurement period.
+	// MaxHops bounds the edges of a path. Candidates caps the paths per
+	// demand. Fresh selection reserves distinct best paths in interactive,
+	// realtime, bulk order before adding edge-diverse alternatives.
+	// RelayProbe is how many relays an unusable demand pair is probed over.
+	// ProbeIntervalMS is the measurement period.
 	MaxHops, Candidates, RelayProbe int
 	ProbeIntervalMS                 int64
 	// Switch is the hysteresis of a first path's change (Hold in
@@ -308,8 +310,9 @@ type PathSet struct {
 	// PreferFirst applies the first path to all flow classes after a
 	// failure, until an ordinary cost-based switch replaces it.
 	PreferFirst bool
-	// Why says why each path holds its place (diagnostics):
-	// "shortest", "diverse shared=N", "kept: …".
+	// Why gives one diagnostic per path in the same order. Examples include
+	// "shortest", "realtime: cheapest for datagram flows", "bulk: cheapest
+	// for bulk flows", "diverse shared=N", and "kept: …".
 	Why []string
 }
 

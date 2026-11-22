@@ -2,6 +2,7 @@ package route
 
 import (
 	"cmp"
+	"maps"
 	"slices"
 	"testing"
 
@@ -70,6 +71,83 @@ func TestClassOrders(t *testing.T) {
 	pt2, _ := Compute(Inputs{Topo: tp, Links: lt, Now: now}, nil, true)
 	if p := set(t, pt2, 1, 3).Paths; !slices.Equal(p[0].Hops, []NodeID{3}) {
 		t.Fatalf("reverse direction counted: %+v", p)
+	}
+}
+
+func TestCandidateClassWinners(t *testing.T) {
+	tp := topo(6, Demand{Src: 1, Dst: 6})
+	lt := LinkTable{}
+	// The direct path wins for interactive flows, relay 5 for realtime,
+	// and relay 4 for bulk. Relays 2 and 3 rank ahead of both class
+	// winners by interactive cost.
+	lossy := LinkMeas{RTTus: 1_000, LossPPM: 20_000, NoDatagram: true}
+	meas(lt, 1, 6, lossy)
+	meas(lt, 1, 2, lossy)
+	up(lt, 2, 6, 100)
+	meas(lt, 1, 3, lossy)
+	up(lt, 3, 6, 200)
+	up(lt, 1, 4, 2_500)
+	up(lt, 4, 6, 2_500)
+	wide := LinkMeas{RTTus: 1_600, RateOutBps: 100e6}
+	meas(lt, 1, 5, wide)
+	meas(lt, 5, 6, wide)
+
+	for _, tc := range []struct {
+		name  string
+		limit int
+		want  [][]NodeID
+	}{
+		{"default", 0, [][]NodeID{{6}, {5, 6}, {4, 6}}},
+		{"one", 1, [][]NodeID{{6}}},
+		{"two prefer realtime over bulk", 2, [][]NodeID{{6}, {5, 6}}},
+		{"spare capacity", 4, [][]NodeID{{6}, {5, 6}, {4, 6}, {2, 6}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			topo := *tp
+			topo.Candidates = tc.limit
+			pt, _ := Compute(Inputs{Topo: &topo, Links: lt, Now: now}, nil, true)
+			ps := set(t, pt, 1, 6)
+			if got := hops(ps); !slices.EqualFunc(got, tc.want, slices.Equal) {
+				t.Fatalf("paths %v (%v), want %v", got, ps.Why, tc.want)
+			}
+		})
+	}
+
+	t.Run("reduced while holding first", func(t *testing.T) {
+		prev, _ := Compute(Inputs{Topo: tp, Links: lt, Now: now}, nil, true)
+		tp.Candidates = 1
+		updated := maps.Clone(lt)
+		up(updated, 1, 5, 500)
+		up(updated, 5, 6, 500)
+		pt, _ := Compute(Inputs{Topo: tp, Links: updated, Now: now}, prev, true)
+		if got := hops(set(t, pt, 1, 6)); !slices.EqualFunc(got, [][]NodeID{{6}}, slices.Equal) || pt.Recheck == 0 {
+			t.Fatalf("paths %v, recheck %d, want the held first path within the new limit", got, pt.Recheck)
+		}
+	})
+}
+
+func TestCandidateDiversityAfterClassWinners(t *testing.T) {
+	tp := topo(5, Demand{Src: 1, Dst: 5})
+	tp.MaxHops, tp.Candidates = 3, 4
+	lt := LinkTable{}
+	meas(lt, 1, 5, LinkMeas{RTTus: 1_000, RateOutBps: 20e6})
+	wide := LinkMeas{RTTus: 4_000, RateOutBps: 100e6}
+	meas(lt, 1, 2, wide)
+	meas(lt, 2, 5, wide)
+	meas(lt, 2, 3, wide)
+	meas(lt, 3, 5, wide)
+	meas(lt, 1, 4, LinkMeas{RTTus: 20_000, RateOutBps: 20e6})
+	meas(lt, 4, 5, LinkMeas{RTTus: 20_000, RateOutBps: 20e6})
+	pt, _ := Compute(Inputs{Topo: tp, Links: lt, Now: now}, nil, true)
+	ps := set(t, pt, 1, 5)
+	// Interactive and realtime share the direct path. The disjoint
+	// alternative precedes the cheaper one that shares the bulk path's first edge.
+	want := [][]NodeID{{5}, {2, 5}, {4, 5}, {2, 3, 5}}
+	if got := hops(ps); !slices.EqualFunc(got, want, slices.Equal) {
+		t.Fatalf("paths %v (%v), want %v", got, ps.Why, want)
+	}
+	if want := []string{"shortest", "bulk: cheapest for bulk flows", "diverse shared=0", "diverse shared=1"}; !slices.Equal(ps.Why, want) {
+		t.Fatalf("reasons %v, want %v", ps.Why, want)
 	}
 }
 

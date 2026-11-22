@@ -1,9 +1,10 @@
 // Package route computes candidate paths over a measured topology: per
 // demand (source, destination, an optional via set one of which the path
-// must cross, an optional allow set it must stay in) up to K paths — the
-// cheapest for interactive flows, then each the cheapest sharing the
-// fewest edges with those picked, plus the cheapest for bulk and for
-// realtime flows — within a hop limit and over transit nodes only.
+// must cross, an optional allow set it must stay in) up to Topo.Candidates
+// paths within a hop limit and over transit nodes only. Fresh selection
+// reserves distinct class winners as described by Topo.Candidates. It
+// fills any remaining slots with the cheapest interactive paths among
+// those sharing the fewest edges with all paths already picked.
 //
 // The inputs are injected: the nodes (active, transit, bias, uplink
 // fees), the node pair overrides (forbid, must, bias), the demands, both

@@ -18,6 +18,7 @@ type label struct {
 	path   []NodeID // hops after the source
 	node   NodeID
 	hit    bool
+	prefix *pathPrefix
 	idx    int // heap index, -1 popped
 }
 
@@ -49,33 +50,40 @@ func (h *lheap) Pop() any {
 }
 
 type skey struct {
-	node NodeID
-	hops int
-	hit  bool
+	node   NodeID
+	hops   int
+	hit    bool
+	prefix *pathPrefix
 }
 
-// shortest is the hop-bounded lexicographic shortest path: weight
-// (edges shared with used, cost), ties by fewer hops, then the smaller
-// node id sequence. Middle hops must be transit nodes; the path must
-// cross via (empty: no constraint; the source or destination in via
+// pathPrefix tracks selected routes from the same source to the same
+// destination. A nil prefix means the search has diverged from all of them.
+type pathPrefix struct {
+	next map[NodeID]*pathPrefix
+}
+
+// shortest is the hop-bounded lexicographic shortest path outside selected:
+// weight (edges shared with used, cost), ties by fewer hops, then the
+// smaller node id sequence. Middle hops must be transit nodes; the path
+// must cross via (empty: no constraint; the source or destination in via
 // satisfies it). nil when there is none.
-func (g *graph) shortest(src, dst NodeID, via []NodeID, used map[Edge]struct{}, cls pathcost.Class) *Path {
+func (g *graph) shortest(src, dst NodeID, via []NodeID, used map[Edge]struct{}, selected *pathPrefix, cls pathcost.Class) *Path {
 	h := g.in.Topo.MaxHops
 	inVia := func(n NodeID) bool { return len(via) == 0 || slices.Contains(via, n) }
 	best := map[skey]*label{}
 	done := map[skey]bool{}
-	start := &label{node: src, hit: inVia(src)}
-	best[skey{src, 0, start.hit}] = start
+	start := &label{node: src, hit: inVia(src), prefix: selected}
+	best[skey{src, 0, start.hit, start.prefix}] = start
 	pq := &lheap{start}
 	for pq.Len() > 0 {
 		u := heap.Pop(pq).(*label)
-		k := skey{u.node, len(u.path), u.hit}
+		k := skey{u.node, len(u.path), u.hit, u.prefix}
 		if done[k] {
 			continue
 		}
 		done[k] = true
 		if u.node == dst {
-			if u.hit {
+			if u.hit && u.prefix == nil {
 				return g.costed(src, slices.Clone(u.path))
 			}
 			continue // never through the destination
@@ -93,8 +101,11 @@ func (g *graph) shortest(src, dst NodeID, via []NodeID, used map[Edge]struct{}, 
 			if _, ok := used[e]; ok {
 				n.shared++
 			}
+			if u.prefix != nil {
+				n.prefix = u.prefix.next[v]
+			}
 			n.path = append(slices.Clip(u.path), v)
-			nk := skey{v, len(n.path), n.hit}
+			nk := skey{v, len(n.path), n.hit, n.prefix}
 			if done[nk] {
 				continue
 			}
@@ -108,63 +119,72 @@ func (g *graph) shortest(src, dst NodeID, via []NodeID, used map[Edge]struct{}, 
 	return nil
 }
 
-// costed is the path hops from src with its costs of both classes.
+// costed is the path hops from src with its costs for each class.
 func (g *graph) costed(src NodeID, hops []NodeID) *Path {
 	ls := g.pathLinks(src, hops)
 	return &Path{Hops: hops, CostUs: pathcost.Path(ls, pathcost.Interactive), BulkCostUs: pathcost.Path(ls, pathcost.Bulk),
 		RtCostUs: pathcost.Path(ls, pathcost.Realtime), Sum: pathcost.Summary(ls)}
 }
 
-// cands are up to K candidates: the shortest for interactive
-// flows, then each the cheapest of those sharing the fewest edges with
-// the ones picked; the cheapest for bulk flows takes the last place when
-// none of them is it (one set serves every class, the user orders it by
-// its flow's class).
+// cands reserves the class winners before filling the remaining slots
+// with alternatives that share as few edges as possible with those picked.
 func (g *graph) cands(src, dst NodeID, via []NodeID) ([]Path, []string) {
-	out, why := g.candsOf(src, dst, via)
-	if len(out) == 0 {
-		return out, why
-	}
-	// one set serves every class: the cheapest of bulk and of realtime
-	// flows take the last places when none of them is it
-	for _, x := range []struct {
-		c   pathcost.Class
-		why string
-	}{{pathcost.Bulk, "bulk: cheapest for bulk flows"}, {pathcost.Realtime, "realtime: cheapest for datagram flows"}} {
-		b := g.shortest(src, dst, via, nil, x.c)
-		if b == nil || slices.ContainsFunc(out, func(o Path) bool { return slices.Equal(o.Hops, b.Hops) }) {
-			continue
-		}
-		if len(out) >= g.in.Topo.Candidates && len(out) > 1 {
-			out, why = out[:len(out)-1], why[:len(why)-1]
-		}
-		out, why = append(out, *b), append(why, x.why)
-	}
-	return out, why
-}
-
-func (g *graph) candsOf(src, dst NodeID, via []NodeID) ([]Path, []string) {
-	used := map[Edge]struct{}{}
+	limit := g.in.Topo.Candidates
 	var out []Path
 	var why []string
-	for range g.in.Topo.Candidates {
-		p := g.shortest(src, dst, via, used, pathcost.Interactive)
-		if p == nil || slices.ContainsFunc(out, func(o Path) bool { return slices.Equal(o.Hops, p.Hops) }) {
-			break
+	for _, x := range []struct {
+		cls pathcost.Class
+		why string
+	}{
+		{pathcost.Interactive, "shortest"},
+		{pathcost.Realtime, "realtime: cheapest for datagram flows"},
+		{pathcost.Bulk, "bulk: cheapest for bulk flows"},
+	} {
+		p := g.shortest(src, dst, via, nil, nil, x.cls)
+		if p == nil {
+			return out, why
 		}
+		if slices.ContainsFunc(out, func(o Path) bool { return slices.Equal(o.Hops, p.Hops) }) {
+			continue
+		}
+		out, why = append(out, *p), append(why, x.why)
+		if len(out) == limit {
+			return out, why
+		}
+	}
+
+	used := map[Edge]struct{}{}
+	selected := &pathPrefix{}
+	record := func(hops []NodeID) int {
 		shared := 0
-		for _, e := range edgesOf(src, p.Hops) {
+		from, prefix := src, selected
+		for _, hop := range hops {
+			e := MakeEdge(from, hop)
 			if _, ok := used[e]; ok {
 				shared++
 			}
 			used[e] = struct{}{}
+			if prefix.next == nil {
+				prefix.next = map[NodeID]*pathPrefix{}
+			}
+			if prefix.next[hop] == nil {
+				prefix.next[hop] = &pathPrefix{}
+			}
+			from, prefix = hop, prefix.next[hop]
 		}
-		if len(out) == 0 {
-			why = append(why, "shortest")
-		} else {
-			why = append(why, fmt.Sprintf("diverse shared=%d", shared))
+		return shared
+	}
+	for _, p := range out {
+		record(p.Hops)
+	}
+	for len(out) < limit {
+		p := g.shortest(src, dst, via, used, selected, pathcost.Interactive)
+		if p == nil {
+			break
 		}
+		shared := record(p.Hops)
 		out = append(out, *p)
+		why = append(why, fmt.Sprintf("diverse shared=%d", shared))
 	}
 	return out, why
 }
@@ -380,6 +400,9 @@ func (g *graph) pathSet(d Demand, via []NodeID, old *PathSet, p Pending) (PathSe
 	// unusable, fill up with the new candidates.
 	kept := PathSet{Dst: d.Dst, Via: d.Via, Allow: d.Allow, PreferFirst: old.PreferFirst}
 	for i, p := range old.Paths {
+		if len(kept.Paths) == g.in.Topo.Candidates {
+			break
+		}
 		if g.pathAllowed(d.Src, p.Hops, via) && g.pathUp(d.Src, p.Hops, i == 0 && old.PreferFirst) {
 			kept.Paths = append(kept.Paths, *g.costed(d.Src, p.Hops))
 			w := "kept: previous order"
