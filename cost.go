@@ -1,6 +1,9 @@
 package pathcost
 
-import "math"
+import (
+	"math"
+	"math/bits"
+)
 
 // Class is a flow class: which property of a path matters. It is
 // derived from the flow (ClassOf), never configured.
@@ -45,7 +48,7 @@ func ClassOf(datagram, bulk bool) Class {
 	return Interactive
 }
 
-func (c Class) ref() float64 {
+func (c Class) ref() uint64 {
 	if c == Bulk {
 		return refBulk
 	}
@@ -85,7 +88,7 @@ const MinElapsedPPM = 1_000_000 / 30
 // Fee is the configured cost of an edge's bytes per MiB (µs): λ × the
 // unit price of its uplinks (both ends) plus the scarcity of their
 // quotas, and whether one is spent. FeeOf builds it; λ is applied once
-// there, so a fee travels (a band, a path summary) as a time.
+// there, so a fee travels through the cost model as a time.
 type Fee struct {
 	UsPerMiB  uint64
 	Exhausted bool
@@ -104,7 +107,7 @@ func FeeOf(lambda, pricePerGiB uint64, scarcity uint32, exhausted bool) Fee {
 
 // Add is the fee of bytes paying both f and g (the two ends of an edge).
 func (f Fee) Add(g Fee) Fee {
-	return Fee{UsPerMiB: min(f.UsPerMiB+g.UsPerMiB, Exhausted-1), Exhausted: f.Exhausted || g.Exhausted}
+	return Fee{UsPerMiB: min(min(f.UsPerMiB, Exhausted-1)+min(g.UsPerMiB, Exhausted-1), Exhausted-1), Exhausted: f.Exhausted || g.Exhausted}
 }
 
 // FeeBand is the band of f (Band): BandExhausted when spent.
@@ -173,16 +176,24 @@ type Link struct {
 const LossDown = 500_000
 
 // Unknown reports that nothing of l was measured.
-func (l Link) Unknown() bool { return l.RTTus == 0 && l.LossPPM == 0 && l.RateBps == 0 }
+func (l Link) Unknown() bool {
+	return l.RTTus == 0 && l.LossPPM == 0 && l.RateBps == 0 && l.QueueUs == 0
+}
 
+func (l Link) effectiveRTT() uint32 {
+	if l.RTTus == 0 {
+		return 1000
+	}
+	return l.RTTus
+}
 func (l Link) throughput(c Class) float64 {
 	t := math.MaxFloat64
-	loss := l.LossPPM
+	loss := min(l.LossPPM, 1_000_000)
 	if c == Realtime && l.NoDatagram {
 		loss = min(loss*RealtimeLossFactor, 1_000_000)
 	}
 	if loss > 0 {
-		rtt := float64(max(l.RTTus, 1)) / 1e6
+		rtt := float64(l.effectiveRTT()) / 1e6
 		p := float64(min(loss, 1_000_000)) / 1e6
 		t = mss * mathisC / (rtt * math.Sqrt(p))
 	}
@@ -200,6 +211,16 @@ func (l Link) Throughput() float64 { return l.throughput(Interactive) }
 // Edge is the cost of l alone for class c (µs, at least 1).
 func Edge(l Link, c Class) uint64 { return Path([]Link{l}, c) }
 
+// Whole microseconds fit in a signed 128-bit sum even at the maximum
+// length of a []Link, including eight times each uint64 fee for bulk.
+type microseconds struct{ hi, lo uint64 }
+
+func (s *microseconds) add(hi, lo uint64) {
+	var carry uint64
+	s.lo, carry = bits.Add64(s.lo, lo, 0)
+	s.hi += hi + carry
+}
+
 // Path is the cost of a path of links for class c (µs, at least 1); see
 // the package comment for its terms.
 func Path(ls []Link, c Class) uint64 {
@@ -207,66 +228,49 @@ func Path(ls []Link, c Class) uint64 {
 		return 1
 	}
 	ref := c.ref()
-	mib := ref / (1 << 20)
-	var rtt, queue, fee, bias float64
+	const mib = 1 << 20
+	var total microseconds
+	var remainder uint64 // fractional fee in units of 1/mib µs
 	tput := math.MaxFloat64
 	var extra uint64
 	for _, l := range ls {
-		r := l.RTTus
-		if r == 0 {
-			r = 1000
-		}
-		rtt += float64(r)
-		queue += float64(l.QueueUs)
 		tput = min(tput, l.throughput(c))
-		fee += float64(l.Fee.UsPerMiB)
-		bias += float64(l.BiasUs)
+		// Split the fee before scaling so the fractional part is exact.
+		fee := l.Fee.UsPerMiB
+		total.add(bits.Mul64(fee/mib, ref))
+		remainder += (fee % mib) * ref
+		total.add(0, uint64(l.effectiveRTT())+uint64(l.QueueUs)+remainder/mib)
+		remainder %= mib
+		total.add(uint64(l.BiasUs>>63), uint64(l.BiasUs))
 		if l.Fee.Exhausted {
-			extra += Exhausted
+			extra = Exhausted
 		}
 	}
-	v := rtt + queue
 	if tput < math.MaxFloat64 {
-		v += ref / tput * 1e6
-	}
-	v += fee*mib + bias
-	return clampAdd(v, extra)
-}
-
-// Summary is the path ls as one link: the RTTs and queueing
-// delays added up, the narrowest throughput as its rate, the fees and
-// biases summed, exhausted when an edge is. Path of the summary with
-// further links prices the joined path as Path of all of them would for
-// interactive and bulk flows (the throughput is taken without the
-// realtime loss factor, a carrier's datagram support being per edge).
-func Summary(ls []Link) Link {
-	var s Link
-	var rtt uint64
-	tput := math.MaxFloat64
-	for _, l := range ls {
-		r := uint64(l.RTTus)
-		if r == 0 {
-			r = 1000
+		whole, frac := math.Modf(float64(ref) / tput * 1e6)
+		total.add(0, uint64(whole))
+		if frac >= float64(mib-remainder)/mib {
+			total.add(0, 1)
 		}
-		rtt += r + uint64(l.QueueUs)
-		tput = min(tput, l.throughput(Interactive))
-		s.Fee = s.Fee.Add(l.Fee)
-		s.BiasUs += l.BiasUs
-		s.NoDatagram = s.NoDatagram || l.NoDatagram
 	}
-	s.RTTus = uint32(min(rtt, math.MaxUint32))
-	if tput < math.MaxFloat64 {
-		s.RateBps = max(uint64(tput), 1)
+	if int64(total.hi) < 0 {
+		return 1 + extra
 	}
-	return s
+	if total.hi != 0 || total.lo >= Exhausted {
+		return Exhausted - 1 + extra
+	}
+	return max(total.lo, 1) + extra
 }
 
-func clampAdd(v float64, extra uint64) uint64 {
-	const lim = float64(Exhausted - 1)
-	if v > lim || math.IsNaN(v) {
-		v = lim
+// AddBias combines two configured preferences, saturating at the signed limits.
+func AddBias(a, b int64) int64 {
+	if b > 0 && a > math.MaxInt64-b {
+		return math.MaxInt64
 	}
-	return max(uint64(max(v, 0)), 1) + min(extra, Exhausted)
+	if b < 0 && a < math.MinInt64-b {
+		return math.MinInt64
+	}
+	return a + b
 }
 
 // Bands quantise a cost term into 6 bits for compact announcement: band

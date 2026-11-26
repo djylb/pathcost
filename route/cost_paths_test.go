@@ -12,7 +12,7 @@ import (
 func meas(lt LinkTable, a, b NodeID, m LinkMeas) {
 	e := MakeEdge(a, b)
 	s := lt[e]
-	m.Up, m.At, m.From = true, now, a
+	m.Up, m.At = true, now
 	s[Side(e, a)] = m
 	lt[e] = s
 }
@@ -113,6 +113,32 @@ func TestCandidateClassWinners(t *testing.T) {
 		})
 	}
 
+	t.Run("pinned relay reserves class slots", func(t *testing.T) {
+		before := maps.Clone(lt)
+		up(before, 1, 2, 1)
+		up(before, 2, 6, 1)
+		prev, _ := Compute(Inputs{Topo: tp, Links: before, Now: now}, nil, true)
+		pt, _ := Compute(Inputs{Topo: tp, Links: lt, Now: now}, prev, true)
+		want := [][]NodeID{{2, 6}, {5, 6}, {4, 6}}
+		if got := hops(set(t, pt, 1, 6)); !slices.EqualFunc(got, want, slices.Equal) {
+			t.Fatalf("got %v want %v", got, want)
+		}
+		// Fail the relay, then restore it as the direct fallback goes down.
+		failed := maps.Clone(before)
+		down(failed, 1, 2)
+		fallback, _ := Compute(Inputs{Topo: tp, Links: failed, Now: now + 1}, prev, false)
+		if got := set(t, fallback, 1, 6).Paths[0].Hops; !slices.Equal(got, []NodeID{6}) {
+			t.Fatalf("fallback %v", got)
+		}
+		restored := maps.Clone(lt)
+		up(restored, 1, 2, 100_000)
+		down(restored, 1, 6)
+		recovered, _ := Compute(Inputs{Topo: tp, Links: restored, Now: now + 2}, fallback, false)
+		ps := set(t, recovered, 1, 6)
+		if !ps.PreferFirst || !slices.EqualFunc(hops(ps), want, slices.Equal) {
+			t.Fatalf("recovered paths %v, prefer first %t, want %v", hops(ps), ps.PreferFirst, want)
+		}
+	})
 	t.Run("reduced while holding first", func(t *testing.T) {
 		prev, _ := Compute(Inputs{Topo: tp, Links: lt, Now: now}, nil, true)
 		tp.Candidates = 1

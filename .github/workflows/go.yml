@@ -32,8 +32,8 @@ jobs:
         with:
           go-version: ${{ matrix.go }}
           cache: false
-      - run: go test -race -count=1 ./...
-      - run: go test -race -count=1 ./...
+      - run: go test -timeout 30s -race -count=1 ./...
+      - run: go test -timeout 30s -race -count=1 ./...
         working-directory: standalone
 
   cross-vet:
@@ -61,7 +61,7 @@ jobs:
           do
             export GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0
             echo "::group::$target"
-            { go vet ./... && go test -c -o /dev/null ./...; } || failed+=("$target")
+            { go vet ./... && go test -timeout 30s -c -o /dev/null ./...; } || failed+=("$target")
             echo "::endgroup::"
           done
           if [ ${#failed[@]} -gt 0 ]; then
@@ -90,7 +90,7 @@ jobs:
           cache: false
       - name: go test on js/wasm under node
         # cross-vet only builds the tests; this runs them on the fake js network stack.
-        run: PATH="$PATH:$(go env GOROOT)/lib/wasm" GOOS=js GOARCH=wasm go test -count=1 ./...
+        run: PATH="$PATH:$(go env GOROOT)/lib/wasm" GOOS=js GOARCH=wasm go test -timeout 30s -count=1 ./...
 
   gofmt:
     runs-on: ubuntu-latest

@@ -9,12 +9,11 @@
 // The inputs are injected: the nodes (active, transit, bias, uplink
 // fees), the node pair overrides (forbid, must, bias), the demands, both
 // ends' link reports (LinkTable) and the time. Compute is pure: the
-// caller owns the state and the schedule, passes the previous table and
-// the edges that changed (ChangedEdge), and recomputes at the table's
+// caller owns the state and the schedule, passes the previous table, and recomputes at the table's
 // Recheck time while a switch waits out its hysteresis. A first path
 // changes only once a candidate is cheaper by Topo.Switch.GainPct for
 // Topo.Switch.Hold measurement periods (at once when the old one is
-// unusable); smaller cost moves keep a set as it was. A path lost to
+// unusable); published segments track effective link changes. A path lost to
 // an outage stays a recovery candidate. While a fallback is up,
 // returning to the failed path requires the configured gain in probed
 // RTT over the same number of consecutive fresh rounds.

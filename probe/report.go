@@ -32,7 +32,7 @@ func delayMoved(n, o uint32) bool {
 	if d < 0 {
 		d = -d
 	}
-	return d >= max(int64(o)*ReportRTTPct/100, ReportFloorUs)
+	return d >= ReportFloorUs && pathcost.Moved(uint64(n), uint64(o), ReportRTTPct)
 }
 
 // RateMoved reports a rate change worth a report: known ↔ unknown, or a

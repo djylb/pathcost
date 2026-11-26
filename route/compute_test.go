@@ -25,14 +25,14 @@ func topo(n int, ds ...Demand) *Topo {
 func up(lt LinkTable, a, b NodeID, rtt uint32) {
 	e := MakeEdge(a, b)
 	s := lt[e]
-	s[Side(e, a)] = LinkMeas{Up: true, RTTus: rtt, At: now, From: a}
+	s[Side(e, a)] = LinkMeas{Up: true, RTTus: rtt, At: now}
 	lt[e] = s
 }
 
 func down(lt LinkTable, a, b NodeID) {
 	e := MakeEdge(a, b)
 	s := lt[e]
-	s[Side(e, a)] = LinkMeas{Up: false, At: now, From: a}
+	s[Side(e, a)] = LinkMeas{Up: false, At: now}
 	lt[e] = s
 }
 
@@ -219,8 +219,8 @@ func TestDeterministic(t *testing.T) {
 	}
 }
 
-// 5 % jitter changes nothing; a 12 % cheaper new path takes the
-// first place.
+// Small cost changes refresh published links. A new first path must
+// sustain the configured gain for the full hold.
 func TestHysteresis(t *testing.T) {
 	tp := topo(3, Demand{Src: 1, Dst: 3})
 	lt := LinkTable{}
@@ -234,7 +234,7 @@ func TestHysteresis(t *testing.T) {
 	up(lt, 1, 3, 1050) // 5 %
 	ch := map[Edge]struct{}{MakeEdge(1, 3): {}}
 	pt2, dirty := Compute(Inputs{Topo: tp, Links: lt, Now: now, Changed: ch}, pt, false)
-	if pt2.Gen != pt.Gen || len(dirty) != 0 {
+	if pt2.Gen == pt.Gen || len(dirty) == 0 {
 		t.Fatalf("5 %% jitter: gen %d→%d dirty %v", pt.Gen, pt2.Gen, dirty)
 	}
 	up(lt, 1, 3, 1250) // relay 1100 is 12 % cheaper: kept, nothing pending
@@ -314,7 +314,10 @@ func TestIncrementalDiff(t *testing.T) {
 					continue
 				}
 				fresh := Inputs{Topo: tp, Links: lt, Now: now}
-				ac, ok := buildGraph(fresh).pathUsable(d.Src, a.Paths[0].Hops, nil)
+				g := buildGraph(fresh)
+				current := a.Paths[0].Hops
+				ok := g.pathAllowed(d.Src, current, nil) && g.pathUp(d.Src, current, false)
+				ac := g.interactivePath(d.Src, current).CostUs
 				_, waiting := inc.Pending[fmt.Sprintf("%d:%s", d.Src, d.Key())]
 				if !ok || !waiting && ac*100 > b.Paths[0].CostUs*100*100/uint64(100-tp.Switch.GainPct)+100 {
 					t.Fatalf("round %d %v: inc first %v (%d, %v) vs full %v (%d)", round, d, a.Paths[0].Hops, ac, ok, b.Paths[0].Hops, b.Paths[0].CostUs)
@@ -354,7 +357,7 @@ func TestProbeClosure(t *testing.T) {
 	}
 }
 
-// TopoOf-independent budget check: V=64, E=256 full compute.
+// Full computation budget check: V=64, E=256 full compute.
 func BenchmarkCompute64(b *testing.B) {
 	r := rand.New(rand.NewPCG(3, 4))
 	var ds []Demand
@@ -378,16 +381,15 @@ func BenchmarkCompute64(b *testing.B) {
 	}
 }
 
-// The relay path coming back after its link quota cleared
-// against the switch hysteresis, with the link table of a loaded
-// devcluster run: the rates measured on the test's own traffic follow
+// The relay path coming back after its link quota cleared competes
+// against the switch hysteresis. The rates measured on the traffic follow
 // the scheduling, here 400 kB/s on 3→2, so 3-2-4 costs about 42 ms
 // against about 47 ms of 3-1-4 (1-3 biased 30 ms): not 20 % cheaper, no switch
 // ever starts. With 1-3 biased 100 ms the switch waits out the hold and
 // takes place.
 func TestRelayBackAgainstHysteresis(t *testing.T) {
 	meas := func(from NodeID, rtt uint32, out, in uint64) LinkMeas {
-		return LinkMeas{Up: true, RTTus: rtt, At: now, From: from, RateOutBps: out, RateInBps: in}
+		return LinkMeas{Up: true, RTTus: rtt, At: now, RateOutBps: out, RateInBps: in}
 	}
 	lt := LinkTable{
 		MakeEdge(1, 2): {meas(1, 1, 4637943, 0), meas(2, 1, 1000000, 7050249)},

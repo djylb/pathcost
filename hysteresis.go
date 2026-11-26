@@ -1,10 +1,11 @@
 package pathcost
 
+import "math/bits"
+
 // Hysteresis is when a cheaper alternative takes the place of the
 // current choice: only once it is cheaper by GainPct for Hold
 // consecutive measurement periods (an unusable current choice is
-// replaced at once); cost moves below PushPct leave a published choice
-// as it is. Zero fields take the defaults (Norm).
+// replaced at once). Callers can use Pushed to throttle publication. Zero fields take the defaults (Norm).
 type Hysteresis struct {
 	GainPct, Hold, PushPct uint64
 }
@@ -16,7 +17,7 @@ const (
 	DefaultPushPct = 20
 )
 
-// Norm is h with its zero fields set to the defaults.
+// Norm fills zero fields with defaults and limits percentages to 100.
 func (h Hysteresis) Norm() Hysteresis {
 	if h.GainPct == 0 {
 		h.GainPct = DefaultGainPct
@@ -27,25 +28,30 @@ func (h Hysteresis) Norm() Hysteresis {
 	if h.PushPct == 0 {
 		h.PushPct = DefaultPushPct
 	}
+	h.GainPct = min(h.GainPct, 100)
+	h.PushPct = min(h.PushPct, 100)
 	return h
 }
 
 // Better reports cand cheaper than cur by h.GainPct.
-func (h Hysteresis) Better(cand, cur uint64) bool { return CheaperBy(cand, cur, h.GainPct) }
+func (h Hysteresis) Better(cand, cur uint64) bool { return CheaperBy(cand, cur, h.Norm().GainPct) }
 
 // Pushed reports a cost move from o to n worth publishing (h.PushPct).
-func (h Hysteresis) Pushed(n, o uint64) bool { return Moved(n, o, h.PushPct) }
+func (h Hysteresis) Pushed(n, o uint64) bool { return Moved(n, o, h.Norm().PushPct) }
 
 // CheaperBy reports cand at least pct % below cur.
 func CheaperBy(cand, cur uint64, pct uint64) bool {
-	return float64(cand)*100 <= float64(cur)*float64(100-pct)
+	return cand < cur && Moved(cand, cur, pct)
 }
 
-// Moved reports a change from o to n of pct % of o or more.
+// Moved reports a nonzero change from o to n of at least min(pct, 100) percent.
+// Every change from a zero baseline qualifies.
 func Moved(n, o, pct uint64) bool {
 	d := n - o
 	if n < o {
 		d = o - n
 	}
-	return d*100 >= o*pct
+	a, b := bits.Mul64(d, 100)
+	c, e := bits.Mul64(o, min(pct, 100))
+	return d != 0 && (a > c || a == c && b >= e)
 }

@@ -2,62 +2,16 @@ package route
 
 import (
 	"cmp"
-	"container/heap"
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strconv"
 
 	"github.com/djylb/pathcost"
 )
 
-// label is a search state's best path.
-type label struct {
-	shared int
-	cost   uint64
-	path   []NodeID // hops after the source
-	node   NodeID
-	hit    bool
-	prefix *pathPrefix
-	idx    int // heap index, -1 popped
-}
-
-func less(a, b *label) bool {
-	if a.shared != b.shared {
-		return a.shared < b.shared
-	}
-	if a.cost != b.cost {
-		return a.cost < b.cost
-	}
-	if len(a.path) != len(b.path) {
-		return len(a.path) < len(b.path)
-	}
-	return slices.Compare(a.path, b.path) < 0
-}
-
-type lheap []*label
-
-func (h lheap) Len() int           { return len(h) }
-func (h lheap) Less(i, j int) bool { return less(h[i], h[j]) }
-func (h lheap) Swap(i, j int)      { h[i], h[j] = h[j], h[i]; h[i].idx = i; h[j].idx = j }
-func (h *lheap) Push(x any)        { l := x.(*label); l.idx = len(*h); *h = append(*h, l) }
-func (h *lheap) Pop() any {
-	old := *h
-	l := old[len(old)-1]
-	*h = old[:len(old)-1]
-	l.idx = -1
-	return l
-}
-
-type skey struct {
-	node   NodeID
-	hops   int
-	hit    bool
-	prefix *pathPrefix
-}
-
-// pathPrefix tracks selected routes from the same source to the same
-// destination. A nil prefix means the search has diverged from all of them.
+// A prefix trie excludes alternatives already selected for this demand.
 type pathPrefix struct {
 	next map[NodeID]*pathPrefix
 }
@@ -67,71 +21,103 @@ type pathPrefix struct {
 // smaller node id sequence. Middle hops must be transit nodes; the path
 // must cross via (empty: no constraint; the source or destination in via
 // satisfies it). nil when there is none.
-func (g *graph) shortest(src, dst NodeID, via []NodeID, used map[Edge]struct{}, selected *pathPrefix, cls pathcost.Class) *Path {
-	h := g.in.Topo.MaxHops
-	inVia := func(n NodeID) bool { return len(via) == 0 || slices.Contains(via, n) }
-	best := map[skey]*label{}
-	done := map[skey]bool{}
-	start := &label{node: src, hit: inVia(src), prefix: selected}
-	best[skey{src, 0, start.hit, start.prefix}] = start
-	pq := &lheap{start}
-	for pq.Len() > 0 {
-		u := heap.Pop(pq).(*label)
-		k := skey{u.node, len(u.path), u.hit, u.prefix}
-		if done[k] {
-			continue
-		}
-		done[k] = true
-		if u.node == dst {
-			if u.hit && u.prefix == nil {
-				return g.costed(src, slices.Clone(u.path))
+func (g *graph) shortest(src, dst NodeID, via []NodeID, used map[Edge]struct{}, selected *pathPrefix, allClasses bool) [3]*Path {
+	var winners [3]*Path
+	if src == dst {
+		return winners
+	}
+	var costs [3]uint64
+	var bestShared int
+	var visit func(NodeID, []NodeID, bool, int, *pathPrefix)
+	visit = func(node NodeID, hops []NodeID, hit bool, shared int, prefix *pathPrefix) {
+		hit = hit || slices.Contains(via, node)
+		if node == dst {
+			if slices.Equal(hops, g.excluded) || !hit || prefix != nil {
+				return
 			}
-			continue // never through the destination
+			p := g.interactivePath(src, hops)
+			if allClasses {
+				p.priceOtherClasses()
+			}
+			var saved *Path
+			for cls, cost := range [...]uint64{pathcost.Interactive: p.CostUs, pathcost.Bulk: p.BulkCostUs, pathcost.Realtime: p.RtCostUs} {
+				if cost == 0 { // class omitted from this search
+					continue
+				}
+				best := winners[cls]
+				if best == nil || shared < bestShared || shared == bestShared && (cost < costs[cls] || cost == costs[cls] && (len(hops) < len(best.Hops) || len(hops) == len(best.Hops) && slices.Compare(hops, best.Hops) < 0)) {
+					if saved == nil {
+						p.Hops = slices.Clone(hops)
+						saved = new(p)
+					}
+					winners[cls] = saved
+					costs[cls] = cost
+				}
+			}
+			bestShared = shared
+			return
 		}
-		if len(u.path) >= h || u.node != src && !g.transit(u.node) {
-			continue
+		if len(hops) >= g.in.Topo.MaxHops {
+			return
 		}
-		for _, v := range g.adj[u.node] {
-			if v == src || slices.Contains(u.path, v) || v != dst && !g.transit(v) {
+		neighbors := g.adj[node]
+		if len(hops)+1 == g.in.Topo.MaxHops {
+			if !g.usable(MakeEdge(node, dst)) {
+				return
+			}
+			neighbors = []NodeID{dst}
+		}
+		for _, next := range neighbors {
+			if next == src || slices.Contains(hops, next) || next != dst && !g.transit(next) {
 				continue
 			}
-			e := MakeEdge(u.node, v)
-			c := g.dcost(u.node, v, cls)
-			n := &label{shared: u.shared, cost: u.cost + c, node: v, hit: u.hit || inVia(v) && len(via) > 0}
-			if _, ok := used[e]; ok {
-				n.shared++
+			n := shared
+			if _, ok := used[MakeEdge(node, next)]; ok {
+				n++
 			}
-			if u.prefix != nil {
-				n.prefix = u.prefix.next[v]
-			}
-			n.path = append(slices.Clip(u.path), v)
-			nk := skey{v, len(n.path), n.hit, n.prefix}
-			if done[nk] {
+			if winners[pathcost.Interactive] != nil && n > bestShared {
 				continue
 			}
-			if o := best[nk]; o != nil && !less(n, o) {
-				continue
+			var child *pathPrefix
+			if prefix != nil {
+				child = prefix.next[next]
 			}
-			best[nk] = n // a worse label still queued is skipped once nk is done
-			heap.Push(pq, n)
+			visit(next, append(hops, next), hit, n, child)
 		}
 	}
-	return nil
+	visit(src, nil, len(via) == 0, 0, selected)
+	if p := winners[pathcost.Interactive]; !allClasses && p != nil {
+		p.priceOtherClasses()
+	}
+	return winners
 }
 
-// costed is the path hops from src with its costs for each class.
-func (g *graph) costed(src NodeID, hops []NodeID) *Path {
+func (g *graph) interactivePath(src NodeID, hops []NodeID) Path {
 	ls := g.pathLinks(src, hops)
-	return &Path{Hops: hops, CostUs: pathcost.Path(ls, pathcost.Interactive), BulkCostUs: pathcost.Path(ls, pathcost.Bulk),
-		RtCostUs: pathcost.Path(ls, pathcost.Realtime), Sum: pathcost.Summary(ls)}
+	return Path{Hops: hops, Links: ls, CostUs: pathcost.Path(ls, pathcost.Interactive)}
+}
+
+func (p *Path) priceOtherClasses() {
+	p.BulkCostUs = pathcost.Path(p.Links, pathcost.Bulk)
+	p.RtCostUs = pathcost.Path(p.Links, pathcost.Realtime)
 }
 
 // cands reserves the class winners before filling the remaining slots
 // with alternatives that share as few edges as possible with those picked.
-func (g *graph) cands(src, dst NodeID, via []NodeID) ([]Path, []string) {
+func (g *graph) cands(src, dst NodeID, via []NodeID, pinned *Path, winners [3]*Path) ([]Path, []string) {
 	limit := g.in.Topo.Candidates
 	var out []Path
 	var why []string
+	if pinned != nil {
+		if pinned.BulkCostUs == 0 {
+			pinned.priceOtherClasses()
+		}
+		out = append(out, *pinned)
+		why = append(why, "kept: switch threshold or hold pending")
+		if limit == 1 {
+			return out, why
+		}
+	}
 	for _, x := range []struct {
 		cls pathcost.Class
 		why string
@@ -140,7 +126,10 @@ func (g *graph) cands(src, dst NodeID, via []NodeID) ([]Path, []string) {
 		{pathcost.Realtime, "realtime: cheapest for datagram flows"},
 		{pathcost.Bulk, "bulk: cheapest for bulk flows"},
 	} {
-		p := g.shortest(src, dst, via, nil, nil, x.cls)
+		if pinned != nil && x.cls == pathcost.Interactive {
+			continue
+		}
+		p := winners[x.cls]
 		if p == nil {
 			return out, why
 		}
@@ -178,7 +167,7 @@ func (g *graph) cands(src, dst NodeID, via []NodeID) ([]Path, []string) {
 		record(p.Hops)
 	}
 	for len(out) < limit {
-		p := g.shortest(src, dst, via, used, selected, pathcost.Interactive)
+		p := g.shortest(src, dst, via, used, selected, false)[pathcost.Interactive]
 		if p == nil {
 			break
 		}
@@ -205,41 +194,35 @@ func (g *graph) viaOK(src, dst NodeID, via []NodeID) ([]NodeID, bool) {
 	return out, len(out) > 0
 }
 
-// Compute is the path table of in: every demand when prev is nil
-// or full is set (a structural change), else only the demands whose
-// paths cross a changed edge or that end on a changed edge's node;
-// the others keep prev's sets. A new first path replaces the old one
-// after the cost hysteresis or if the old is unusable. A first
-// path lost to an outage waits for fresh RTT evidence before returning.
-// It returns the sources whose sets or probe list changed.
+// Compute calculates a read-only snapshot. Pass full after structural changes.
+// The second result identifies sources with changed probe lists or unequal
+// path sets under [PathSet.Equal]. A diagnostic-only change to Why is ignored.
+// A changed effective link may introduce a new path for any demand.
 func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]struct{}) {
-	in.Topo.Norm()
+	topo := *in.Topo
+	topo.Norm()
+	in.Topo = &topo
+	in.Now = max(in.Now, 0)
 	g := buildGraph(in)
 	if prev == nil {
 		full = true
 	}
 	out := &PathTable{BySrc: map[NodeID][]PathSet{}, Used: g.edges, Pending: map[string]Pending{}}
-	changed := in.Changed
+	// An interior edge can open a path for any demand. Compare effective
+	// directed links so expiration and carrier changes need no caller hint.
+	var changed map[Edge]struct{}
 	if !full {
-		// A report can expire without a new input from the caller.
-		copied := false
-		for ed, state := range prev.Used {
-			if next := out.Used[ed]; state.Usable && !next.Usable || state.Available != next.Available {
-				if _, ok := changed[ed]; ok {
-					continue
+		changed = maps.Clone(in.Changed)
+		for _, states := range []map[Edge]EdgeState{prev.Used, g.edges} {
+			for e := range states {
+				if prev.Used[e] != g.edges[e] {
+					if changed == nil {
+						changed = map[Edge]struct{}{}
+					}
+					changed[e] = struct{}{}
 				}
-				if !copied {
-					changed = make(map[Edge]struct{}, len(in.Changed)+1)
-					maps.Copy(changed, in.Changed)
-					copied = true
-				}
-				changed[ed] = struct{}{}
 			}
 		}
-	}
-	touched := map[NodeID]bool{}
-	for e := range changed {
-		touched[e.A], touched[e.B] = true, true
 	}
 	for _, d := range in.Topo.Demand {
 		var old *PathSet
@@ -249,9 +232,9 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 		key := switchKey(d)
 		p, waiting := prev.pending(key)
 		recovering := p.recovery != nil
-		due := waiting && !recovering && in.Now >= p.Since+in.Topo.holdMS()
-		rebuild := full || due || touched[d.Src] || touched[d.Dst] ||
-			old != nil && crosses(d.Src, old, changed) || recovering && crossesPath(d.Src, p.Hops, changed)
+		due := waiting && !recovering && in.Now-p.Since >= in.Topo.holdMS()
+		g.allow = d.Allow
+		rebuild := full || due || g.affected(d, changed) || recovering && len(p.recovery.alternative.Hops) > 0
 		if !rebuild && !recovering {
 			if old != nil {
 				out.BySrc[d.Src] = append(out.BySrc[d.Src], *old)
@@ -261,7 +244,6 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 			}
 			continue
 		}
-		g.allow = d.Allow
 		via, allowed := g.viaOK(d.Src, d.Dst, d.Via)
 		if !allowed || !g.allowed(d.Src) || !g.allowed(d.Dst) {
 			continue
@@ -270,6 +252,9 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 		if ps, p, recovering = g.recover(d, via, old, p, rebuild); recovering {
 			if p.recovery != nil {
 				out.Pending[key] = p
+				if q := p.recovery.alternative; len(q.Hops) > 0 {
+					out.recheck(q, in.Topo.holdMS())
+				}
 			}
 		} else {
 			ps, p = g.pathSet(d, via, old, p)
@@ -299,7 +284,7 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 	}
 	for _, m := range []map[NodeID][]PathSet{out.BySrc, prev.BySrc} {
 		for s := range m {
-			if !slices.EqualFunc(out.BySrc[s], prev.BySrc[s], sameSet) {
+			if !slices.EqualFunc(out.BySrc[s], prev.BySrc[s], PathSet.Equal) {
 				dirty[s] = struct{}{}
 			}
 		}
@@ -318,6 +303,31 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 	return out, dirty
 }
 
+// A simple path containing e needs a hop for e and at least one more
+// for each endpoint of the demand outside e. Interior vertices must
+// be permitted transit nodes even if the edge has just disappeared.
+func (g *graph) affected(d Demand, changed map[Edge]struct{}) bool {
+edges:
+	for e := range changed {
+		if !g.allowed(e.A) || !g.allowed(e.B) {
+			continue
+		}
+		hops := 1
+		for _, n := range [2]NodeID{e.A, e.B} {
+			if n != d.Src && n != d.Dst {
+				if !g.transit(n) {
+					continue edges
+				}
+				hops++
+			}
+		}
+		if hops <= g.in.Topo.MaxHops {
+			return true
+		}
+	}
+	return false
+}
+
 // pending is the switch waiting for key in t; t may be nil.
 func (t *PathTable) pending(key string) (Pending, bool) {
 	if t == nil {
@@ -331,118 +341,81 @@ func switchKey(d Demand) string { return strconv.FormatInt(d.Src, 10) + ":" + d.
 
 func (t *PathTable) wait(key string, p Pending, hold int64) {
 	t.Pending[key] = p
+	t.recheck(p, hold)
+}
+func (t *PathTable) recheck(p Pending, hold int64) {
+	if hold > math.MaxInt64-p.Since {
+		return
+	}
 	if at := p.Since + hold; t.Recheck == 0 || at < t.Recheck {
 		t.Recheck = at
 	}
 }
 
-// crosses reports a path of ps over a changed edge.
-func crosses(src NodeID, ps *PathSet, changed map[Edge]struct{}) bool {
-	return slices.ContainsFunc(ps.Paths, func(p Path) bool { return crossesPath(src, p.Hops, changed) })
-}
-
-func crossesPath(src NodeID, hops []NodeID, changed map[Edge]struct{}) bool {
-	for _, n := range hops {
-		if _, ok := changed[MakeEdge(src, n)]; ok {
-			return true
-		}
-		src = n
-	}
-	return false
-}
-
-// sameSet compares the sent part of two sets (hops, costs, via).
-func sameSet(a, b PathSet) bool {
-	return a.Dst == b.Dst && a.PreferFirst == b.PreferFirst && slices.Equal(a.Via, b.Via) && slices.Equal(a.Allow, b.Allow) && slices.EqualFunc(a.Paths, b.Paths, func(x, y Path) bool {
-		return x.CostUs == y.CostUs && x.BulkCostUs == y.BulkCostUs && x.RtCostUs == y.RtCostUs && slices.Equal(x.Hops, y.Hops)
+// Equal compares published paths, constraints and selection policy. Why is diagnostic.
+func (s PathSet) Equal(other PathSet) bool {
+	return cmpSet(s, other) == 0 && s.PreferFirst == other.PreferFirst && slices.EqualFunc(s.Paths, other.Paths, func(x, y Path) bool {
+		return slices.Equal(x.Links, y.Links) && x.CostUs == y.CostUs && x.BulkCostUs == y.BulkCostUs && x.RtCostUs == y.RtCostUs && slices.Equal(x.Hops, y.Hops)
 	})
 }
 
-func (g *graph) candidates(d Demand, via []NodeID) PathSet {
-	paths, why := g.cands(d.Src, d.Dst, via)
-	return PathSet{Dst: d.Dst, Via: d.Via, Allow: d.Allow, Paths: paths, Why: why}
+func (g *graph) winners(d Demand, via []NodeID) [3]*Path {
+	return g.shortest(d.Src, d.Dst, via, nil, nil, g.in.Topo.Candidates > 1)
+}
+func (g *graph) candidates(d Demand, via []NodeID, pinned *Path, winners [3]*Path) PathSet {
+	paths, why := g.cands(d.Src, d.Dst, via, pinned, winners)
+	return PathSet{Dst: d.Dst, Via: slices.Clone(d.Via), Allow: slices.Clone(d.Allow), Paths: paths, Why: why}
+}
+
+// Reuse the search result when the retained path also won a class.
+func (g *graph) retained(src NodeID, hops []NodeID, winners [3]*Path) *Path {
+	for _, p := range winners {
+		if p != nil && slices.Equal(p.Hops, hops) {
+			return p
+		}
+	}
+	return new(g.interactivePath(src, hops))
 }
 
 // pathSet applies the cost hysteresis to ordinary path changes.
 func (g *graph) pathSet(d Demand, via []NodeID, old *PathSet, p Pending) (PathSet, Pending) {
-	ps := g.candidates(d, via)
+	winners := g.winners(d, via)
+	build := func(pinned *Path) PathSet { return g.candidates(d, via, pinned, winners) }
+	best := winners[pathcost.Interactive]
 	if old == nil {
-		return ps, Pending{}
+		return build(nil), Pending{}
 	}
 	current := old.Paths[0].Hops
-	oc, ok := g.pathUsable(d.Src, current, via)
-	if !ok {
-		if !old.PreferFirst || !g.pathAllowed(d.Src, current, via) || !g.pathUp(d.Src, current, true) {
-			return g.settle(ps, old), Pending{}
-		}
-		oc = g.pathCost(d.Src, current, pathcost.Interactive)
+	if !g.pathAllowed(d.Src, current, via) || !g.pathUp(d.Src, current, old.PreferFirst) {
+		return build(nil), Pending{}
 	}
-	if len(ps.Paths) == 0 {
-		g.prefer(&ps, d.Src, current, "kept: previous path still available")
-		return g.settle(ps, old), Pending{}
+	if best == nil {
+		ps := build(g.retained(d.Src, current, winners))
+		ps.Why[0], ps.PreferFirst = "kept: previous path still available", true
+		return ps, Pending{}
 	}
-	if slices.Equal(current, ps.Paths[0].Hops) {
+	if slices.Equal(current, best.Hops) {
+		ps := build(nil)
 		ps.PreferFirst = old.PreferFirst
-		return g.settle(ps, old), Pending{}
+		return ps, Pending{}
 	}
+	pinned := g.retained(d.Src, current, winners)
+	oc := pinned.CostUs
 	var pending Pending
-	if g.in.Topo.Switch.Better(ps.Paths[0].CostUs, oc) {
-		if !slices.Equal(p.Hops, ps.Paths[0].Hops) {
-			p = Pending{Hops: ps.Paths[0].Hops, Since: g.in.Now}
+	if g.in.Topo.Switch.Better(best.CostUs, oc) {
+		if !slices.Equal(p.Hops, best.Hops) {
+			p = Pending{Hops: best.Hops, Since: g.in.Now}
 		}
 		if g.in.Now-p.Since >= g.in.Topo.holdMS() {
-			ps.Why[0] = fmt.Sprintf("shortest: %d%% cheaper than the previous first for %d ms", 100-ps.Paths[0].CostUs*100/max(oc, 1), g.in.Now-p.Since)
-			return g.settle(ps, old), Pending{}
+			ps := build(nil)
+			ps.Why[0] = fmt.Sprintf("shortest: %d%% cheaper than the previous first for %d ms", 100-best.CostUs*100/max(oc, 1), g.in.Now-p.Since)
+			return ps, Pending{}
 		}
 		pending = p
 	}
-	// Keep the old order (each cost refreshed), drop the old paths gone
-	// unusable, fill up with the new candidates.
-	kept := PathSet{Dst: d.Dst, Via: d.Via, Allow: d.Allow, PreferFirst: old.PreferFirst}
-	for i, p := range old.Paths {
-		if len(kept.Paths) == g.in.Topo.Candidates {
-			break
-		}
-		if g.pathAllowed(d.Src, p.Hops, via) && g.pathUp(d.Src, p.Hops, i == 0 && old.PreferFirst) {
-			kept.Paths = append(kept.Paths, *g.costed(d.Src, p.Hops))
-			w := "kept: previous order"
-			if i == 0 {
-				w = fmt.Sprintf("kept: new best %d us not %d%% below %d us for %d periods yet", ps.Paths[0].CostUs, g.in.Topo.Switch.GainPct, oc, g.in.Topo.Switch.Hold)
-			}
-			kept.Why = append(kept.Why, w)
-		}
-	}
-	for i, p := range ps.Paths {
-		if len(kept.Paths) >= g.in.Topo.Candidates {
-			break
-		}
-		if !slices.ContainsFunc(kept.Paths, func(o Path) bool { return slices.Equal(o.Hops, p.Hops) }) {
-			kept.Paths = append(kept.Paths, p)
-			kept.Why = append(kept.Why, ps.Why[i])
-		}
-	}
-	return g.settle(kept, old), pending
-}
-
-// settle returns old itself (unchanged) when ps has its hops in order
-// and every cost within Topo.Switch.PushPct of old's (smaller cost
-// changes do not change a set).
-func (g *graph) settle(ps PathSet, old *PathSet) PathSet {
-	if ps.PreferFirst != old.PreferFirst || len(ps.Paths) != len(old.Paths) {
-		return ps
-	}
-	for i, p := range ps.Paths {
-		o := old.Paths[i]
-		if !slices.Equal(p.Hops, o.Hops) {
-			return ps
-		}
-		if sw := g.in.Topo.Switch; sw.Pushed(p.CostUs, o.CostUs) || sw.Pushed(p.BulkCostUs, o.BulkCostUs) {
-			return ps
-		}
-	}
-	keep := *old
-	keep.Why = ps.Why
-	return keep
+	ps := build(pinned)
+	ps.PreferFirst = old.PreferFirst
+	return ps, pending
 }
 
 // relayWindow is how many probe intervals one relay of a usable pair is
@@ -474,32 +447,19 @@ func (g *graph) probe(prevBad map[Edge]int64, paths *PathTable) (map[NodeID][]No
 		return cmp.Compare(a.ID, b.ID)
 	})
 	bad := map[Edge]int64{}
-	pairs := map[[2]NodeID]bool{}
-	for _, d := range t.Demand {
-		pairs[[2]NodeID{d.Src, d.Dst}] = true
-		for _, v := range d.Via {
-			if v != d.Src && v != d.Dst {
-				pairs[[2]NodeID{d.Src, v}] = true
-				pairs[[2]NodeID{v, d.Dst}] = true
-			}
-		}
-	}
-	for e, c := range t.Cover {
-		if c.Mode == LinkMust {
-			pairs[[2]NodeID{e.A, e.B}] = true
-		}
-	}
 	usableRelays := func(s, d NodeID) []Node {
 		var out []Node
 		for _, r := range relays {
-			if r.ID != s && r.ID != d && t.Cover[MakeEdge(s, r.ID)].Mode != LinkForbid && t.Cover[MakeEdge(r.ID, d)].Mode != LinkForbid {
+			if g.allowed(r.ID) && r.ID != s && r.ID != d && t.Cover[MakeEdge(s, r.ID)].Mode != LinkForbid && t.Cover[MakeEdge(r.ID, d)].Mode != LinkForbid {
 				out = append(out, r)
 			}
 		}
 		return out
 	}
-	for _, p := range sortedPairs(pairs) {
-		s, d := p[0], p[1]
+	plan := func(s, d NodeID) {
+		if s == d || !g.allowed(s) || !g.allowed(d) || !t.Nodes[s].Active || !t.Nodes[d].Active {
+			return
+		}
 		add(s, d)
 		e := MakeEdge(s, d)
 		if g.usable(e) {
@@ -508,11 +468,11 @@ func (g *graph) probe(prevBad map[Edge]int64, paths *PathTable) (map[NodeID][]No
 			// by load order, so a better relay can be found without
 			// probing every pair over every node.
 			if rs := usableRelays(s, d); len(rs) > 0 {
-				r := rs[int((g.in.Now/(relayWindow*t.ProbeIntervalMS))%int64(len(rs)))]
+				r := rs[int((g.in.Now/t.ProbeIntervalMS/relayWindow)%int64(len(rs)))]
 				add(s, r.ID)
 				add(r.ID, d)
 			}
-			continue
+			return
 		}
 		since, ok := prevBad[e]
 		if !ok {
@@ -520,7 +480,7 @@ func (g *graph) probe(prevBad map[Edge]int64, paths *PathTable) (map[NodeID][]No
 		}
 		bad[e] = since
 		if g.in.Now-since < t.ProbeIntervalMS {
-			continue
+			return
 		}
 		for i, r := range usableRelays(s, d) {
 			if i >= t.RelayProbe {
@@ -528,6 +488,29 @@ func (g *graph) probe(prevBad map[Edge]int64, paths *PathTable) (map[NodeID][]No
 			}
 			add(s, r.ID)
 			add(r.ID, d)
+		}
+	}
+	for _, d := range t.Demand {
+		g.allow = d.Allow
+		if !g.allowed(d.Src) || !g.allowed(d.Dst) || !t.Nodes[d.Src].Active || !t.Nodes[d.Dst].Active || d.Src == d.Dst {
+			continue
+		}
+		vs, ok := g.viaOK(d.Src, d.Dst, d.Via)
+		if !ok {
+			continue
+		}
+		plan(d.Src, d.Dst)
+		for _, v := range vs {
+			if v != d.Src && v != d.Dst {
+				plan(d.Src, v)
+				plan(v, d.Dst)
+			}
+		}
+	}
+	g.allow = nil
+	for e, c := range t.Cover {
+		if c.Mode == LinkMust {
+			plan(e.A, e.B)
 		}
 	}
 	// Every hop of both paths needs comparable RTT while recovering.
@@ -566,38 +549,10 @@ func (g *graph) probe(prevBad map[Edge]int64, paths *PathTable) (map[NodeID][]No
 	return out, bad
 }
 
-func sortedPairs(m map[[2]NodeID]bool) [][2]NodeID {
-	out := make([][2]NodeID, 0, len(m))
-	for p := range m {
-		out = append(out, p)
-	}
-	slices.SortFunc(out, func(a, b [2]NodeID) int {
-		if c := cmp.Compare(a[0], b[0]); c != 0 {
-			return c
-		}
-		return cmp.Compare(a[1], b[1])
-	})
-	return out
-}
-
 // holdMS is the hysteresis hold in ms.
-func (t *Topo) holdMS() int64 { return int64(min(t.Switch.Hold, 1<<31)) * t.ProbeIntervalMS }
-
-// Recompute thresholds of ChangedEdge: an edge whose interactive cost
-// moved by ChangePct % of the cost it was computed with, and at least
-// ChangeFloorUs, is worth a recomputation.
-const (
-	ChangePct     = 20
-	ChangeFloorUs = 5000
-)
-
-// ChangedEdge reports that an edge computed as old now is (cost, usable)
-// enough to recompute the demands over it (Inputs.Changed): its
-// usability changed, or its cost moved max(ChangePct %, ChangeFloorUs).
-func ChangedEdge(old EdgeState, cost uint64, usable bool) bool {
-	d := int64(cost) - int64(old.Cost)
-	if d < 0 {
-		d = -d
+func (t *Topo) holdMS() int64 {
+	if t.Switch.Hold > uint64(math.MaxInt64/t.ProbeIntervalMS) {
+		return math.MaxInt64
 	}
-	return usable != old.Usable || usable && d >= max(int64(old.Cost)*ChangePct/100, ChangeFloorUs)
+	return int64(t.Switch.Hold) * t.ProbeIntervalMS
 }

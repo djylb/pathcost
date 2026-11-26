@@ -71,3 +71,26 @@ func TestMoved(t *testing.T) {
 		t.Fatal("median/rate")
 	}
 }
+func TestSessionProbeBoundaries(t *testing.T) {
+	var e Estimator
+	e.Probe(-1)
+	e.Probe(0)
+	if e.Known() {
+		t.Fatal("invalid sample")
+	}
+	e.Session(Sample{RTT: 30 * time.Millisecond, QueueDelay: 20 * time.Millisecond}, false)
+	for range MissDown {
+		e.Lost()
+	}
+	if !e.Up() {
+		t.Fatal("live session marked down")
+	}
+	e.Down()
+	e.Probe(1)
+	if e.QueueUs() != 0 || e.RTTus() != 1 {
+		t.Fatal(e.Link())
+	}
+	if Rate(1<<62, time.Nanosecond) != ^uint64(0) || Rate(1<<62+1, time.Second) != 1<<62+1 {
+		t.Fatal("rate")
+	}
+}

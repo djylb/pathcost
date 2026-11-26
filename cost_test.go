@@ -1,6 +1,9 @@
 package pathcost
 
-import "testing"
+import (
+	"math"
+	"testing"
+)
 
 // The quality orderings: loss and a low rate cost throughput,
 // interactive flows weigh RTT and bulk flows throughput.
@@ -134,27 +137,76 @@ func TestBands(t *testing.T) {
 	}
 }
 
-// A path's summary joined with a last hop costs what the whole path
-// does.
-func TestSummary(t *testing.T) {
-	path := []Link{{RTTus: 3000, LossPPM: 1000, QueueUs: 200, Fee: FeeOf(0, 1, 0, false), BiasUs: 500}, {RTTus: 7000, RateBps: 5e6, Fee: Fee{Exhausted: true}}}
-	last := Link{RTTus: 9000, LossPPM: 30_000}
-	for _, c := range []Class{Interactive, Bulk} {
-		whole := Path(append(append([]Link{}, path...), last), c)
-		joined := Path([]Link{Summary(path), last}, c)
-		d := int64(whole) - int64(joined)
-		if d < -2 || d > 2 {
-			t.Fatalf("class %d: whole %d, joined %d", c, whole, joined)
-		}
-	}
-	if Path([]Link{Summary(nil)}, Interactive) != Path([]Link{{}}, Interactive) {
-		t.Fatal("empty summary")
-	}
-}
-
 // The switch rule: 20 % cheaper.
 func TestCheaper(t *testing.T) {
 	if CheaperBy(81, 100, 20) || !CheaperBy(80, 100, 20) || !CheaperBy(75, 100, 25) || CheaperBy(76, 100, 25) {
 		t.Fatal("gain")
+	}
+}
+func TestArithmeticBoundaries(t *testing.T) {
+	h := Hysteresis{}
+	if h.Better(100, 100) || h.Pushed(100, 100) || CheaperBy(101, 100, 101) || Moved(1<<63-1, 1<<63, 50) || !Moved(0, 1<<63, 50) {
+		t.Fatal("percentage boundary")
+	}
+	links := make([]Link, 16384)
+	for i := range links {
+		links[i].Fee.Exhausted = true
+	}
+	if Path(links, Bulk) < Exhausted {
+		t.Fatal("exhaustion wrapped")
+	}
+	if (Fee{UsPerMiB: ^uint64(0)}).Add(Fee{UsPerMiB: 1}).UsPerMiB != Exhausted-1 {
+		t.Fatal("fee wrapped")
+	}
+	a := Link{LossPPM: 1 << 30, NoDatagram: true}
+	b := a
+	b.RTTus = 1000
+	b.LossPPM = 1000000
+	if Edge(a, Realtime) != Edge(b, Realtime) || (Link{QueueUs: 1}).Unknown() {
+		t.Fatal("effective measurement")
+	}
+}
+
+func TestBiasCancellation(t *testing.T) {
+	const high = 1<<63 - 1
+	if got := Path([]Link{{RTTus: 100, BiasUs: high}, {RTTus: 100, BiasUs: -high + 5}}, Interactive); got != 205 {
+		t.Fatal(got)
+	}
+	if AddBias(high, high) != high || AddBias(-high-1, -high-1) != -high-1 {
+		t.Fatal("bias saturation")
+	}
+}
+
+func TestFeeCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		class Class
+		links []Link
+		want  uint64
+	}{
+		{"single microsecond", Bulk, []Link{
+			{RTTus: 100, Fee: Fee{UsPerMiB: 1 << 49}, BiasUs: -(1 << 53) - 1},
+			{RTTus: 100, Fee: Fee{UsPerMiB: 1 << 49}},
+		}, 199},
+		{"whole word carry", Bulk, []Link{
+			{RTTus: 100, Fee: Fee{UsPerMiB: 1 << 61}, BiasUs: math.MinInt64},
+			{RTTus: 100, BiasUs: math.MinInt64},
+		}, 200},
+		{"fraction below whole microsecond", Interactive, []Link{
+			{RTTus: 100, Fee: Fee{UsPerMiB: math.MaxUint64}, BiasUs: -(1 << 58)},
+		}, 99},
+		{"fraction carried across links", Realtime, []Link{
+			{RTTus: 100, Fee: Fee{UsPerMiB: math.MaxUint64}, BiasUs: -(1 << 58)},
+			{RTTus: 100, Fee: Fee{UsPerMiB: 1}},
+		}, 200},
+		{"fraction carried into transfer time", Interactive, []Link{
+			{RTTus: 100, Fee: Fee{UsPerMiB: 32}, RateBps: 2 * refInteractive * 1_000_000},
+		}, 101},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Path(tc.links, tc.class); got != tc.want {
+				t.Fatalf("cost %d, want %d", got, tc.want)
+			}
+		})
 	}
 }

@@ -144,7 +144,7 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 func (f *recoveryFixture) put(a, b NodeID, up bool, stamp int64, rtt, loss uint32) {
 	e := MakeEdge(a, b)
 	m := f.links[e]
-	m[Side(e, a)] = LinkMeas{From: a, Up: up, At: f.now, RTTus: rtt, ProbeAt: stamp, ProbeRTTus: rtt, LossPPM: loss}
+	m[Side(e, a)] = LinkMeas{Up: up, At: f.now, RTTus: rtt, ProbeAt: stamp, ProbeRTTus: rtt, LossPPM: loss}
 	f.links[e] = m
 }
 
@@ -176,4 +176,22 @@ func (f *recoveryFixture) run(full bool, want []NodeID) PathSet {
 		f.t.Fatalf("at %d: candidates %v, want first %v", f.now, hops(ps), want)
 	}
 	return ps
+}
+
+func TestRecoveryWaitsForReport(t *testing.T) {
+	f := newRecoveryFixture(t)
+	f.topo.Switch.Hold = 1
+	f.run(true, []NodeID{3})
+	f.fail(f.now+1, 1, 3)
+	f.run(false, []NodeID{2, 3})
+	f.round(1000)
+	f.put(1, 3, true, now, 1000, 0)
+	f.put(3, 1, true, f.now, 1000, 0)
+	e := MakeEdge(1, 3)
+	sides := f.links[e]
+	sides[1].At++
+	f.links[e] = sides
+	f.run(false, []NodeID{2, 3})
+	f.now++
+	f.run(false, []NodeID{3})
 }

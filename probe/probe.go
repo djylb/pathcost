@@ -41,7 +41,7 @@ func (s Sample) BaseRTT() time.Duration {
 	if s.RTT <= 0 {
 		return 0
 	}
-	r := s.RTT - s.QueueDelay
+	r := s.RTT - max(s.QueueDelay, 0)
 	if s.MinRTT > 0 {
 		r = max(r, s.MinRTT)
 	}
@@ -65,10 +65,13 @@ type Estimator struct {
 	live     bool
 }
 
-// Probe takes a probe answered after rtt.
+// Probe records a positive RTT outside a live session.
 func (e *Estimator) Probe(rtt time.Duration) {
+	if e.live || rtt <= 0 {
+		return
+	}
 	e.shift()
-	s := uint32(min(rtt/time.Microsecond, 1<<31-1))
+	s := micros(rtt)
 	if !e.known || e.srtt == 0 {
 		e.srtt = s
 	} else {
@@ -80,6 +83,9 @@ func (e *Estimator) Probe(rtt time.Duration) {
 // Lost takes a probe that failed: MissDown in a row is down, and a link
 // never answered is down at once.
 func (e *Estimator) Lost() {
+	if e.live {
+		return
+	}
 	e.shift()
 	e.loss |= 1
 	e.miss++
@@ -103,7 +109,7 @@ func (e *Estimator) Session(s Sample, stale bool) {
 		return
 	}
 	if r := s.BaseRTT(); r > 0 {
-		e.srtt = uint32(min(r/time.Microsecond, 1<<32-1)) // smoothed by the transport, queueing taken out
+		e.srtt = micros(r) // smoothed by the transport, queueing taken out
 		e.queue = uint32(min(max(s.RTT-r, 0)/time.Microsecond, 1<<32-1))
 	}
 	e.sessLoss = s.LossPPM
@@ -111,7 +117,7 @@ func (e *Estimator) Session(s Sample, stale bool) {
 
 // Down takes the end of the live session (or of the peer): the link is
 // down at once and probes estimate it from now on.
-func (e *Estimator) Down() { e.up, e.live = false, false }
+func (e *Estimator) Down() { *e = Estimator{known: e.known} }
 
 // Known reports a sample taken (a session or a probe).
 func (e *Estimator) Known() bool { return e.known }
@@ -168,10 +174,17 @@ func Median(rtts []time.Duration) time.Duration {
 }
 
 // Rate is the throughput of n bytes received in el (bytes/s); 0 when el
-// is not positive.
+// or n is not positive. Positive rates round down and saturate at MaxUint64.
 func Rate(n int64, el time.Duration) uint64 {
 	if el <= 0 || n <= 0 {
 		return 0
 	}
-	return uint64(float64(n) / el.Seconds())
+	hi, lo := bits.Mul64(uint64(n), uint64(time.Second))
+	if hi >= uint64(el) {
+		return ^uint64(0)
+	}
+	q, _ := bits.Div64(hi, lo, uint64(el))
+	return q
 }
+
+func micros(d time.Duration) uint32 { return uint32(min(max(d/time.Microsecond, 1), 1<<32-1)) }

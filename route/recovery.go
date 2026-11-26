@@ -3,6 +3,8 @@ package route
 import (
 	"fmt"
 	"slices"
+
+	"github.com/djylb/pathcost"
 )
 
 // Allow for staggered peer probes while bounding the age of a round.
@@ -11,8 +13,9 @@ const recoveryProbeAgePeriods = 2
 // recovery is the evidence for returning to Pending.Hops after an outage.
 // Each hop on both paths must have a new observation to complete a round.
 type recovery struct {
-	rounds  uint64
-	samples []int64
+	alternative Pending
+	rounds      uint64
+	samples     []int64
 }
 
 // recover handles a first path lost to an outage, preserving its identity
@@ -34,15 +37,15 @@ func (g *graph) recover(d Demand, via []NodeID, old *PathSet, p Pending, rebuild
 	}
 	available := g.pathUp(d.Src, p.Hops, true)
 	if !available {
-		p.Since, p.recovery = g.in.Now, &recovery{}
+		p.Since, p.recovery = g.in.Now, &recovery{alternative: p.recovery.alternative}
 	}
 
 	if !usable {
-		ps := g.candidates(d, via)
 		if available {
-			g.prefer(&ps, d.Src, p.Hops, "recovered: previous path available while current path is down")
+			ps := g.recoveredSet(d, via, p.Hops, "recovered: previous path available while current path is down")
 			return ps, Pending{}, true
 		}
+		ps := g.candidates(d, via, nil, g.winners(d, via))
 		ps.PreferFirst = len(ps.Paths) > 0
 		p.recovery = &recovery{}
 		return ps, p, true
@@ -52,33 +55,31 @@ func (g *graph) recover(d Demand, via []NodeID, old *PathSet, p Pending, rebuild
 		var ready bool
 		p, ready = g.recoveryRound(d.Src, current, p)
 		if ready {
-			ps := g.candidates(d, via)
-			g.prefer(&ps, d.Src, p.Hops, fmt.Sprintf("recovered: RTT at least %d%% lower for %d new probe rounds", g.in.Topo.Switch.GainPct, g.in.Topo.Switch.Hold))
+			ps := g.recoveredSet(d, via, p.Hops, fmt.Sprintf("recovered: RTT at least %d%% lower for %d new probe rounds", g.in.Topo.Switch.GainPct, g.in.Topo.Switch.Hold))
 			return ps, Pending{}, true
 		}
 	}
 	if !rebuild {
 		return *old, p, true
 	}
-	ps := g.candidates(d, via)
-	g.prefer(&ps, d.Src, current, "kept: awaiting recovery of the previous path")
-	return g.settle(ps, old), p, true
+	g.excluded = p.Hops
+	ps, alt := g.pathSet(d, via, old, p.recovery.alternative)
+	g.excluded = nil
+	r := *p.recovery
+	if len(ps.Paths) == 0 || !slices.Equal(current, ps.Paths[0].Hops) {
+		r.samples = nil
+		r.rounds = 0
+	}
+	r.alternative = alt
+	p.recovery = &r
+	return ps, p, true
 }
 
-func (g *graph) prefer(ps *PathSet, src NodeID, hops []NodeID, why string) {
-	i := slices.IndexFunc(ps.Paths, func(p Path) bool { return slices.Equal(p.Hops, hops) })
-	if i >= 0 {
-		copy(ps.Paths[1:i+1], ps.Paths[:i])
-		copy(ps.Why[1:i+1], ps.Why[:i])
-	} else {
-		ps.Paths = append(ps.Paths, Path{})
-		ps.Why = append(ps.Why, "")
-		copy(ps.Paths[1:], ps.Paths)
-		copy(ps.Why[1:], ps.Why)
-		limit := min(len(ps.Paths), g.in.Topo.Candidates)
-		ps.Paths, ps.Why = ps.Paths[:limit], ps.Why[:limit]
-	}
-	ps.Paths[0], ps.Why[0], ps.PreferFirst = *g.costed(src, hops), why, true
+func (g *graph) recoveredSet(d Demand, via, hops []NodeID, why string) PathSet {
+	winners := g.winners(d, via)
+	ps := g.candidates(d, via, g.retained(d.Src, hops, winners), winners)
+	ps.Why[0], ps.PreferFirst = why, true
+	return ps
 }
 
 func (g *graph) recoveryRound(src NodeID, current []NodeID, p Pending) (Pending, bool) {
@@ -95,7 +96,7 @@ func (g *graph) recoveryRound(src NodeID, current []NodeID, p Pending) (Pending,
 		if stamps[i] <= at {
 			return p, false
 		}
-		if stamps[i]-at > recoveryProbeAgePeriods*g.in.Topo.ProbeIntervalMS {
+		if stamps[i]-at > boundedPeriods(g.in.Topo.ProbeIntervalMS, recoveryProbeAgePeriods) {
 			r.rounds = 0
 		}
 	}
@@ -112,11 +113,11 @@ func (g *graph) recoveryRound(src NodeID, current []NodeID, p Pending) (Pending,
 // probedPath sums per-hop round trips made with the same measurement
 // method. A failed, stale or pre-outage observation invalidates the path.
 func (g *graph) probedPath(src NodeID, hops []NodeID, since int64, stamps []int64) (uint64, []int64) {
-	var rtt uint64
+	links := make([]pathcost.Link, 0, len(hops))
 	for _, n := range hops {
 		var latest LinkMeas
 		for _, m := range g.in.Links[MakeEdge(src, n)] {
-			if m.ProbeAt <= since || m.ProbeAt > g.in.Now || g.in.Now-m.ProbeAt > recoveryProbeAgePeriods*g.in.Topo.ProbeIntervalMS {
+			if !g.in.fresh(m) || m.ProbeAt <= since || m.ProbeAt > g.in.Now || g.in.Now-m.ProbeAt > boundedPeriods(g.in.Topo.ProbeIntervalMS, recoveryProbeAgePeriods) {
 				continue
 			}
 			if m.ProbeAt > latest.ProbeAt {
@@ -126,9 +127,9 @@ func (g *graph) probedPath(src NodeID, hops []NodeID, since int64, stamps []int6
 		if !latest.Up || latest.ProbeRTTus == 0 {
 			return 0, stamps
 		}
-		rtt += uint64(latest.ProbeRTTus)
+		links = append(links, pathcost.Link{RTTus: latest.ProbeRTTus})
 		stamps = append(stamps, latest.ProbeAt)
 		src = n
 	}
-	return rtt, stamps
+	return pathcost.Path(links, pathcost.Interactive), stamps
 }

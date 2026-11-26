@@ -30,9 +30,12 @@ pt, changed := route.Compute(route.Inputs{Topo: t, Links: links, Now: nowMS}, pr
 ```
 
 Every input is injected: the topology, both ends' link reports and the
-time. `Compute` is pure; the caller keeps the previous table, passes the
-edges that changed (`route.ChangedEdge`), and recomputes at
+time. `Compute` is pure; the caller passes the previous table and recomputes at
 `PathTable.Recheck` while a cost-based switch waits out its hysteresis.
+Effective changes in either direction rebuild candidates. Pass full after a
+structural change. Snapshots and all borrowed slices are read-only. To extend a
+path, concatenate its Links with the next segment and call pathcost.Path.
+Self demands and self loops yield no route.
 For recovery from an outage, pass comparable per-link round trips with
 `LinkMeas.ProbeRTTus` and `LinkMeas.ProbeAt` and recompute when they
 change. Each round needs a new observation for every hop on both paths.
@@ -54,6 +57,14 @@ overrides (`auto`/`must`/`forbid`, bias, exhausted), link measurements,
 demands (none: every pair) and timed measurement changes; the output is
 the candidate paths with their costs per class and every switch of a
 first path.
+
+The scenario's `switch` object accepts `gain_pct` and `hold`. Zero selects
+the default for either field. Remove `push_pct` from existing scenarios,
+including `"push_pct": 0`, before running them.
+
+Replay timestamps are nonnegative integer milliseconds. Each RTT is in
+milliseconds and must be at least 1 ns (`0.000001` ms). Use `lost` for
+a missing probe response.
 
 ## License
 

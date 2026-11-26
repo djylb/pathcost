@@ -2,12 +2,15 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -40,11 +43,11 @@ type Scenario struct {
 	Steps           []StepJSON   `json:"steps,omitempty"`
 }
 
-// SwitchJSON is pathcost.Hysteresis (0: defaults).
+// SwitchJSON configures the gain and hold for a first-path switch.
+// Zero values select the defaults in pathcost.Hysteresis.
 type SwitchJSON struct {
 	GainPct uint64 `json:"gain_pct,omitempty"`
 	Hold    uint64 `json:"hold,omitempty"`
-	PushPct uint64 `json:"push_pct,omitempty"`
 }
 
 // NodeJSON is one node; every node is active.
@@ -68,7 +71,7 @@ type PairJSON struct {
 	Exhausted bool   `json:"exhausted,omitempty"`
 }
 
-// LinkJSON is a measurement of a→b (both directions unless one_way).
+// LinkJSON is a measurement of a→b (both ends report symmetric rates).
 type LinkJSON struct {
 	A          int64   `json:"a"`
 	B          int64   `json:"b"`
@@ -119,19 +122,49 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		return replayTrace(in, stdout)
 	}
 	var sc Scenario
-	dec := json.NewDecoder(in)
+	reader := &scenarioReader{src: in}
+	dec := json.NewDecoder(reader)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&sc); err != nil {
 		return fmt.Errorf("scenario: %w", err)
 	}
+	tail := bufio.NewReader(io.MultiReader(dec.Buffered(), reader))
+	for {
+		b, err := tail.ReadByte()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return fmt.Errorf("scenario: %w", err)
+		}
+		if b != ' ' && b != '\t' && b != '\n' && b != '\r' {
+			return errors.New("scenario: trailing data")
+		}
+	}
 	return simulate(&sc, stdout, *asJSON)
+}
+
+// A decoder may finish the object using bytes returned with a read error.
+// Keep the error for the subsequent check for end of input.
+type scenarioReader struct {
+	src io.Reader
+	err error
+}
+
+func (r *scenarioReader) Read(p []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	n, err := r.src.Read(p)
+	r.err = err
+	return n, err
 }
 
 // Topo is the route topology of sc.
 func (sc *Scenario) Topo() (*route.Topo, error) {
 	t := &route.Topo{Nodes: map[route.NodeID]route.Node{}, Cover: map[route.Edge]route.Cover{},
 		MaxHops: sc.MaxHops, Candidates: sc.Candidates, ProbeIntervalMS: sc.ProbeIntervalMS,
-		Switch: pathcost.Hysteresis{GainPct: sc.Switch.GainPct, Hold: sc.Switch.Hold, PushPct: sc.Switch.PushPct}}
+		Switch: pathcost.Hysteresis{GainPct: sc.Switch.GainPct, Hold: sc.Switch.Hold}}
 	for _, n := range sc.Nodes {
 		if _, dup := t.Nodes[n.ID]; dup {
 			return nil, fmt.Errorf("node %d twice", n.ID)
@@ -143,8 +176,13 @@ func (sc *Scenario) Topo() (*route.Topo, error) {
 		}
 		t.Nodes[n.ID] = x
 	}
+	seen := map[route.Edge]bool{}
 	for _, p := range sc.Pairs {
 		e := route.MakeEdge(p.A, p.B)
+		if seen[e] || p.A == p.B || !t.Nodes[p.A].Active || !t.Nodes[p.B].Active {
+			return nil, fmt.Errorf("invalid or duplicate pair %v", e)
+		}
+		seen[e] = true
 		var m route.LinkMode
 		switch p.Mode {
 		case "", "auto":
@@ -167,6 +205,13 @@ func (sc *Scenario) Topo() (*route.Topo, error) {
 	}
 	var ds []route.Demand
 	for _, d := range sc.Demand {
+		for _, group := range [][]int64{{d.Src, d.Dst}, d.Allow, d.Via} {
+			for _, id := range group {
+				if !t.Nodes[id].Active {
+					return nil, fmt.Errorf("demand %d->%d: unknown node %d", d.Src, d.Dst, id)
+				}
+			}
+		}
 		ds = append(ds, route.Demand{Src: d.Src, Dst: d.Dst, Via: sorted(d.Via), Allow: sorted(d.Allow)})
 	}
 	if len(sc.Demand) == 0 {
@@ -176,6 +221,28 @@ func (sc *Scenario) Topo() (*route.Topo, error) {
 					ds = append(ds, route.Demand{Src: a.ID, Dst: b.ID})
 				}
 			}
+		}
+	}
+	validate := func(ls []LinkJSON) error {
+		for i, l := range ls {
+			if l.A == l.B || !t.Nodes[l.A].Active || !t.Nodes[l.B].Active {
+				return fmt.Errorf("links[%d]: invalid endpoints %d-%d", i, l.A, l.B)
+			}
+			if !(l.RTTms >= 0 && l.RTTms*1000 <= math.MaxUint32 && l.QueueMs >= 0 && l.QueueMs*1000 <= math.MaxUint32 && l.RateMbps >= 0 && l.RateMbps*125000 < math.Exp2(64) && l.LossPct >= 0 && l.LossPct <= 100) {
+				return fmt.Errorf("links[%d]: measurement out of range", i)
+			}
+		}
+		return nil
+	}
+	if err := validate(sc.Links); err != nil {
+		return nil, err
+	}
+	for i, s := range sc.Steps {
+		if s.AtMS < 0 || s.AtMS == math.MaxInt64 {
+			return nil, fmt.Errorf("steps[%d].at_ms out of range", i)
+		}
+		if err := validate(s.Links); err != nil {
+			return nil, fmt.Errorf("steps[%d]: %w", i, err)
 		}
 	}
 	t.Demand = route.SortDemand(ds)
@@ -209,11 +276,11 @@ func apply(lt route.LinkTable, ls []LinkJSON, now int64) []route.Edge {
 		if m.Up && m.RTTus != 0 {
 			m.ProbeRTTus = uint32(min(uint64(m.RTTus)+uint64(m.QueueUs), 1<<32-1))
 		}
-		rate := uint64(l.RateMbps * 1e6 / 8)
+		rate := uint64(l.RateMbps * 125000)
 		var s [2]route.LinkMeas
-		for i, from := range []int64{e.A, e.B} {
+		for i := range s {
 			x := m
-			x.From = from
+
 			x.RateOutBps, x.RateInBps = rate, rate
 			s[i] = x
 		}
@@ -224,14 +291,16 @@ func apply(lt route.LinkTable, ls []LinkJSON, now int64) []route.Edge {
 
 // event is one line of the output.
 type event struct {
-	AtMS  int64          `json:"at_ms"`
-	Kind  string         `json:"kind"` // paths, switch
-	Src   int64          `json:"src"`
-	Dst   int64          `json:"dst"`
-	Via   []int64        `json:"via,omitempty"`
-	Paths []pathJSON     `json:"paths,omitempty"`
-	From  []route.NodeID `json:"from,omitempty"`
-	To    []route.NodeID `json:"to,omitempty"`
+	Allow       []int64        `json:"allow"`
+	PreferFirst bool           `json:"prefer_first"`
+	AtMS        int64          `json:"at_ms"`
+	Kind        string         `json:"kind"` // paths, switch
+	Src         int64          `json:"src"`
+	Dst         int64          `json:"dst"`
+	Via         []int64        `json:"via,omitempty"`
+	Paths       []pathJSON     `json:"paths,omitempty"`
+	From        []route.NodeID `json:"from,omitempty"`
+	To          []route.NodeID `json:"to,omitempty"`
 }
 
 type pathJSON struct {
@@ -242,22 +311,34 @@ type pathJSON struct {
 	Why    string         `json:"why"`
 }
 
+func visiblePaths(ps route.PathSet) []pathJSON {
+	var paths []pathJSON
+	for i, p := range ps.Paths {
+		why := ""
+		if i < len(ps.Why) {
+			why = ps.Why[i]
+		}
+		paths = append(paths, pathJSON{Hops: p.Hops, CostUs: p.CostUs, BulkUs: p.BulkCostUs, RtUs: p.RtCostUs, Why: why})
+	}
+	return paths
+}
+
 // simulate runs the scenario: the initial computation, then each step and
-// the hysteresis rechecks due before the next step (and after the last,
-// within 2 × the hold).
-func simulate(sc *Scenario, w io.Writer, asJSON bool) error {
+// every pending hysteresis deadline. Measurements at a deadline apply first.
+func simulate(sc *Scenario, w io.Writer, asJSON bool) (err error) {
 	tp, err := sc.Topo()
 	if err != nil {
 		return err
 	}
-	slices.SortStableFunc(sc.Steps, func(a, b StepJSON) int { return int(a.AtMS - b.AtMS) })
+	slices.SortStableFunc(sc.Steps, func(a, b StepJSON) int { return cmp.Compare(a.AtMS, b.AtMS) })
 	const start = 1 // ms; 0 is "no report"
 	lt := route.LinkTable{}
 	apply(lt, sc.Links, start)
-	keep := 3 * tp.KeepaliveMS()
+	keep := tp.KeepaliveMS()
 	var prev *route.PathTable
 	out := bufio.NewWriter(w)
-	defer func() { _ = out.Flush() }()
+	defer flush(out, &err)
+
 	emit := func(e event) error {
 		if asJSON {
 			b, err := json.Marshal(e)
@@ -284,19 +365,13 @@ func simulate(sc *Scenario, w io.Writer, asJSON bool) error {
 			ps, _ := pt.SetOf(d)
 			old, _ := prev.SetOf(d)
 			if prev != nil && first(old) != nil && first(ps) != nil && !slices.Equal(first(old), first(ps)) {
-				if err := emit(event{AtMS: now, Kind: "switch", Src: d.Src, Dst: d.Dst, Via: d.Via, From: first(old), To: first(ps)}); err != nil {
+				if err := emit(event{AtMS: now - start, Kind: "switch", Src: d.Src, Dst: d.Dst, Via: d.Via, Allow: d.Allow, PreferFirst: ps.PreferFirst, From: first(old), To: first(ps)}); err != nil {
 					return err
 				}
 			}
-			if all || prev == nil || !sameSet(old, ps) {
-				e := event{AtMS: now, Kind: "paths", Src: d.Src, Dst: d.Dst, Via: d.Via, Paths: []pathJSON{}}
-				for i, p := range ps.Paths {
-					why := ""
-					if i < len(ps.Why) {
-						why = ps.Why[i]
-					}
-					e.Paths = append(e.Paths, pathJSON{Hops: p.Hops, CostUs: p.CostUs, BulkUs: p.BulkCostUs, RtUs: p.RtCostUs, Why: why})
-				}
+			paths := visiblePaths(ps)
+			if all || prev == nil || old.PreferFirst != ps.PreferFirst || !reflect.DeepEqual(visiblePaths(old), paths) {
+				e := event{AtMS: now - start, Kind: "paths", Src: d.Src, Dst: d.Dst, Via: d.Via, Allow: d.Allow, PreferFirst: ps.PreferFirst, Paths: paths}
 				if err := emit(e); err != nil {
 					return err
 				}
@@ -305,31 +380,47 @@ func simulate(sc *Scenario, w io.Writer, asJSON bool) error {
 		prev = pt
 		return nil
 	}
+	i := 0
+	for i < len(sc.Steps) && sc.Steps[i].AtMS == 0 {
+		apply(lt, sc.Steps[i].Links, start)
+		i++
+	}
 	if err := step(start, nil, true); err != nil {
 		return err
 	}
 	recheck := func(until int64) error {
 		for prev.Recheck != 0 && prev.Recheck <= until {
-			if err := step(prev.Recheck, map[route.Edge]struct{}{}, false); err != nil {
+			due := prev.Recheck
+			if err := step(due, map[route.Edge]struct{}{}, false); err != nil {
 				return err
+			}
+			if prev.Recheck != 0 && prev.Recheck <= due {
+				return errors.New("recheck did not advance")
 			}
 		}
 		return nil
 	}
-	for _, s := range sc.Steps {
+	for i < len(sc.Steps) {
+		s := sc.Steps[i]
 		at := start + s.AtMS
-		if err := recheck(at); err != nil {
+		if err := recheck(at - 1); err != nil {
 			return err
 		}
 		changed := map[route.Edge]struct{}{}
-		for _, e := range apply(lt, s.Links, at) {
-			changed[e] = struct{}{}
+		for i < len(sc.Steps) && sc.Steps[i].AtMS == s.AtMS {
+			for _, e := range apply(lt, sc.Steps[i].Links, at) {
+				changed[e] = struct{}{}
+			}
+			i++
 		}
 		if err := step(at, changed, false); err != nil {
 			return err
 		}
 	}
-	return recheck(prev.Recheck)
+	if err := recheck(math.MaxInt64); err != nil {
+		return err
+	}
+	return nil
 }
 
 func first(ps route.PathSet) []route.NodeID {
@@ -339,16 +430,16 @@ func first(ps route.PathSet) []route.NodeID {
 	return ps.Paths[0].Hops
 }
 
-func sameSet(a, b route.PathSet) bool {
-	return slices.EqualFunc(a.Paths, b.Paths, func(x, y route.Path) bool {
-		return slices.Equal(x.Hops, y.Hops) && x.CostUs == y.CostUs && x.BulkCostUs == y.BulkCostUs && x.RtCostUs == y.RtCostUs
-	})
-}
-
 func printText(w io.Writer, e event) error {
 	via := ""
 	if len(e.Via) > 0 {
 		via = fmt.Sprintf(" via %v", e.Via)
+	}
+	if e.Allow != nil {
+		via += fmt.Sprintf(" allow %v", e.Allow)
+	}
+	if e.PreferFirst {
+		via += " prefer first"
 	}
 	if e.Kind == "switch" {
 		_, err := fmt.Fprintf(w, "%8d ms  switch %d→%d%s: %v → %v\n", e.AtMS, e.Src, e.Dst, via, e.From, e.To)
@@ -372,11 +463,12 @@ func printText(w io.Writer, e event) error {
 // replayTrace feeds probe outcomes (lines "<ms> <rtt_ms>" or "<ms> lost";
 // "#" comments) through a probe.Estimator and prints the estimate after
 // each, with the interactive cost of the link alone.
-func replayTrace(in io.Reader, w io.Writer) error {
+func replayTrace(in io.Reader, w io.Writer) (err error) {
 	var e probe.Estimator
 	sc := bufio.NewScanner(in)
 	out := bufio.NewWriter(w)
-	defer func() { _ = out.Flush() }()
+	defer flush(out, &err)
+
 	for n := 1; sc.Scan(); n++ {
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -390,14 +482,18 @@ func replayTrace(in io.Reader, w io.Writer) error {
 		if err != nil {
 			return fmt.Errorf("trace line %d: %w", n, err)
 		}
+		if at < 0 {
+			return fmt.Errorf("trace line %d: negative time", n)
+		}
 		if f[1] == "lost" {
 			e.Lost()
 		} else {
 			ms, err := strconv.ParseFloat(f[1], 64)
-			if err != nil || ms < 0 {
+			ns := ms * float64(time.Millisecond)
+			if err != nil || !(ns >= 1 && ns < math.Exp2(63)) {
 				return fmt.Errorf("trace line %d: bad rtt %q", n, f[1])
 			}
-			e.Probe(time.Duration(ms * float64(time.Millisecond)))
+			e.Probe(time.Duration(ns))
 		}
 		cost := uint64(0)
 		if e.Up() {
@@ -407,5 +503,14 @@ func replayTrace(in io.Reader, w io.Writer) error {
 			return err
 		}
 	}
-	return sc.Err()
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func flush(w *bufio.Writer, err *error) {
+	if e := w.Flush(); *err == nil {
+		*err = e
+	}
 }
