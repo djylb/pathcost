@@ -205,19 +205,20 @@ const (
 
 // Norm returns a shallow copy with default settings filled in and Switch
 // normalized. The maps and slices are shared with t.
-func (t Topo) Norm() Topo {
-	if t.MaxHops <= 0 {
-		t.MaxHops = DefaultMaxHops
+func (t *Topo) Norm() Topo {
+	n := *t
+	if n.MaxHops <= 0 {
+		n.MaxHops = DefaultMaxHops
 	}
-	if t.Candidates <= 0 {
-		t.Candidates = DefaultCandidates
+	if n.Candidates <= 0 {
+		n.Candidates = DefaultCandidates
 	}
-	if t.RelayProbe <= 0 {
-		t.RelayProbe = DefaultRelayProbe
+	if n.RelayProbe <= 0 {
+		n.RelayProbe = DefaultRelayProbe
 	}
-	t.ProbeIntervalMS = boundedPeriods(t.ProbeIntervalMS, 1)
-	t.Switch = t.Switch.Norm()
-	return t
+	n.ProbeIntervalMS = boundedPeriods(n.ProbeIntervalMS, 1)
+	n.Switch = n.Switch.Norm()
+	return n
 }
 
 func (in Inputs) fresh(m LinkMeas) bool {
