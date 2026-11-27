@@ -226,7 +226,7 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 	}
 	for _, d := range in.Topo.Demand {
 		var old *PathSet
-		if ps, ok := prev.SetOf(d); ok {
+		if ps, ok := prev.SetOf(d); ok && len(ps.Paths) > 0 {
 			old = &ps
 		}
 		key := switchKey(d)
