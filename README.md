@@ -44,7 +44,7 @@ order candidates by flow class.
 
 ## Simulator
 
-`standalone/` is a separate module with a command-line simulator:
+Run the command-line simulator from its separate [`standalone/` module](standalone/).
 
 ```
 cd standalone
@@ -63,9 +63,9 @@ the default for either field. Remove `push_pct` from existing scenarios,
 including `"push_pct": 0`, before running them.
 
 Replay timestamps are nonnegative integer milliseconds. Each RTT is in
-milliseconds and must be at least 1 ns (`0.000001` ms). Use `lost` for
+milliseconds and must be at least one nanosecond (`0.000001` ms). Use `lost` for
 a missing probe response.
 
 ## License
 
-Apache-2.0
+[Apache-2.0](LICENSE)

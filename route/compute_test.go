@@ -11,7 +11,7 @@ import (
 
 const now = 1_000_000
 
-// Topo is n active transit nodes 1..n with the demands ds.
+// topo creates n active transit nodes with IDs from 1 to n and the demands ds.
 func topo(n int, ds ...Demand) *Topo {
 	t := &Topo{Nodes: map[NodeID]Node{}, Cover: map[Edge]Cover{}, Demand: SortDemand(ds)}
 	for i := NodeID(1); i <= NodeID(n); i++ {
@@ -319,7 +319,7 @@ func TestIncrementalDiff(t *testing.T) {
 				ok := g.pathAllowed(d.Src, current, nil) && g.pathUp(d.Src, current, false)
 				ac := g.interactivePath(d.Src, current).CostUs
 				_, waiting := inc.Pending[fmt.Sprintf("%d:%s", d.Src, d.Key())]
-				if !ok || !waiting && ac*100 > b.Paths[0].CostUs*100*100/uint64(100-tp.Switch.GainPct)+100 {
+				if !ok || !waiting && ac*100 > b.Paths[0].CostUs*100*100/(100-tp.Switch.GainPct)+100 {
 					t.Fatalf("round %d %v: inc first %v (%d, %v) vs full %v (%d)", round, d, a.Paths[0].Hops, ac, ok, b.Paths[0].Hops, b.Paths[0].CostUs)
 				}
 			}

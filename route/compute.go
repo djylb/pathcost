@@ -204,14 +204,12 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 	in.Topo = &topo
 	in.Now = max(in.Now, 0)
 	g := buildGraph(in)
-	if prev == nil {
-		full = true
-	}
-	out := &PathTable{BySrc: map[NodeID][]PathSet{}, Used: g.edges, Pending: map[string]Pending{}}
 	// An interior edge can open a path for any demand. Compare effective
 	// directed links so expiration and carrier changes need no caller hint.
 	var changed map[Edge]struct{}
-	if !full {
+	if prev == nil {
+		full = true
+	} else if !full {
 		changed = maps.Clone(in.Changed)
 		for _, states := range []map[Edge]EdgeState{prev.Used, g.edges} {
 			for e := range states {
@@ -224,11 +222,9 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 			}
 		}
 	}
+	out := &PathTable{BySrc: map[NodeID][]PathSet{}, Used: g.edges, Pending: map[string]Pending{}}
 	for _, d := range in.Topo.Demand {
-		var old *PathSet
-		if ps, ok := prev.SetOf(d); ok && len(ps.Paths) > 0 {
-			old = &ps
-		}
+		old, _ := prev.SetOf(d)
 		key := switchKey(d)
 		p, waiting := prev.pending(key)
 		recovering := p.recovery != nil
@@ -236,8 +232,8 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 		g.allow = d.Allow
 		rebuild := full || due || g.affected(d, changed) || recovering && len(p.recovery.alternative.Hops) > 0
 		if !rebuild && !recovering {
-			if old != nil {
-				out.BySrc[d.Src] = append(out.BySrc[d.Src], *old)
+			if len(old.Paths) > 0 {
+				out.BySrc[d.Src] = append(out.BySrc[d.Src], old)
 			}
 			if waiting {
 				out.wait(key, p, in.Topo.holdMS())
@@ -378,11 +374,11 @@ func (g *graph) retained(src NodeID, hops []NodeID, winners [3]*Path) *Path {
 }
 
 // pathSet applies the cost hysteresis to ordinary path changes.
-func (g *graph) pathSet(d Demand, via []NodeID, old *PathSet, p Pending) (PathSet, Pending) {
+func (g *graph) pathSet(d Demand, via []NodeID, old PathSet, p Pending) (PathSet, Pending) {
 	winners := g.winners(d, via)
 	build := func(pinned *Path) PathSet { return g.candidates(d, via, pinned, winners) }
 	best := winners[pathcost.Interactive]
-	if old == nil {
+	if len(old.Paths) == 0 {
 		return build(nil), Pending{}
 	}
 	current := old.Paths[0].Hops

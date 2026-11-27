@@ -1,0 +1,17 @@
+version: "2"
+
+linters:
+  settings:
+    govet:
+      enable:
+        - fieldalignment
+  exclusions:
+    rules:
+      # Checked as fieldalignment. For pointer-byte reports, fields keep
+      # their order of meaning.
+      - linters: [govet]
+        text: '^fieldalignment: (.+ has [0-9]+ leading bytes of pointer data|struct with [0-9]+ pointer bytes)'
+      # Exported field order and the simulator's JSON key order are observable.
+      - linters: [govet]
+        text: '^fieldalignment: (.+ has size|struct of size) [0-9]+'
+        source: '^type ([A-Z][[:alnum:]_]*|event|pathJSON) struct\b'

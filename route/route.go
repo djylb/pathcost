@@ -114,12 +114,11 @@ type LinkMode uint8
 
 // Link modes. The zero value is LinkAuto.
 const (
-	// LinkAuto: the edge counts when measured usable.
+	// LinkAuto includes the edge when measurements show it is usable.
 	LinkAuto LinkMode = iota
-	// LinkMust: the pair is always measured (probed), even without a
-	// demand over it.
+	// LinkMust marks the pair for probing even when no demand uses it.
 	LinkMust
-	// LinkForbid: the pair is never an edge and never probed.
+	// LinkForbid excludes the pair from routing and probing.
 	LinkForbid
 )
 
@@ -143,36 +142,26 @@ type Demand struct {
 }
 
 // Key is the (destination, via, allow) key of d within its source.
-func (d Demand) Key() string { return pairKey(d.Dst, d.Via) + allowKey(d.Allow) }
-
-func allowKey(allow []NodeID) string {
-	if allow != nil && len(allow) == 0 {
-		return "a"
-	}
+func (d Demand) Key() string {
 	var b strings.Builder
-	for i, v := range allow {
-		if i == 0 {
-			b.WriteByte('a')
-		} else {
-			b.WriteByte('.')
-		}
-		b.WriteString(strconv.FormatInt(v, 10))
+	b.WriteString(strconv.FormatInt(d.Dst, 10))
+	if len(d.Via) > 0 {
+		appendNodeKey(&b, 'v', d.Via)
+	}
+	if d.Allow != nil {
+		appendNodeKey(&b, 'a', d.Allow)
 	}
 	return b.String()
 }
 
-func pairKey(dst NodeID, via []NodeID) string {
-	var b strings.Builder
-	b.WriteString(strconv.FormatInt(dst, 10))
-	for i, v := range via {
-		if i == 0 {
-			b.WriteByte('v')
-		} else {
+func appendNodeKey(b *strings.Builder, prefix byte, nodes []NodeID) {
+	b.WriteByte(prefix)
+	for i, n := range nodes {
+		if i > 0 {
 			b.WriteByte('.')
 		}
-		b.WriteString(strconv.FormatInt(v, 10))
+		b.WriteString(strconv.FormatInt(n, 10))
 	}
-	return b.String()
 }
 
 // Topo is the structural input: the vertices, the pair overrides, the

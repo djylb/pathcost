@@ -20,9 +20,9 @@ type recovery struct {
 
 // recover handles a first path lost to an outage, preserving its identity
 // even when it drops out of the candidate set or no fallback is available.
-func (g *graph) recover(d Demand, via []NodeID, old *PathSet, p Pending, rebuild bool) (PathSet, Pending, bool) {
+func (g *graph) recover(d Demand, via []NodeID, old PathSet, p Pending, rebuild bool) (PathSet, Pending, bool) {
 	var current []NodeID
-	if old != nil {
+	if len(old.Paths) > 0 {
 		current = old.Paths[0].Hops
 	}
 	allowed := g.pathAllowed(d.Src, current, via)
@@ -60,7 +60,8 @@ func (g *graph) recover(d Demand, via []NodeID, old *PathSet, p Pending, rebuild
 		}
 	}
 	if !rebuild {
-		return *old, p, true
+		// Probe evidence can change without changing any effective link.
+		return old, p, true
 	}
 	g.excluded = p.Hops
 	ps, alt := g.pathSet(d, via, old, p.recovery.alternative)

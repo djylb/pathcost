@@ -57,9 +57,7 @@ func TestSharedTopologyAndDemandIdentity(t *testing.T) {
 		}
 		var wg sync.WaitGroup
 		for range 2 {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				pt, _ := Compute(Inputs{Topo: tp, Links: lt, Now: now}, nil, false)
 				if _, ok := pt.SetOf(a); !ok {
 					t.Error("missing unrestricted path")
@@ -67,7 +65,7 @@ func TestSharedTopologyAndDemandIdentity(t *testing.T) {
 				if _, ok := pt.SetOf(b); ok {
 					t.Error("empty allow matched")
 				}
-			}()
+			})
 		}
 		wg.Wait()
 		if !reflect.DeepEqual(before, *tp) {

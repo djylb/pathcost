@@ -24,7 +24,7 @@ func runOut(t *testing.T, stdin string, args ...string) string {
 // the switch gain does not switch back.
 func TestDegradeSwitchesAfterHold(t *testing.T) {
 	var evs []event
-	for _, l := range strings.Split(strings.TrimSpace(runOut(t, "", "-json", "testdata/degrade.json")), "\n") {
+	for l := range strings.SplitSeq(strings.TrimSpace(runOut(t, "", "-json", "testdata/degrade.json")), "\n") {
 		var e event
 		if err := json.Unmarshal([]byte(l), &e); err != nil {
 			t.Fatal(err)

@@ -23,7 +23,8 @@ import (
 
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout); err != nil {
-		fmt.Fprintln(os.Stderr, "standalone:", err)
+		// The command is already failing and stderr is its diagnostic stream.
+		_, _ = fmt.Fprintln(os.Stderr, "standalone:", err)
 		os.Exit(1)
 	}
 }

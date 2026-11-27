@@ -65,13 +65,16 @@ const mathisC = 1.22
 // edges that are not, so such a path is chosen only without another.
 const Exhausted = uint64(1) << 50
 
-// Lambdas of three presets: quality first, balanced, saving first (µs
-// per unit price per GiB per MiB of the reference transfer). The numbers
-// are initial values, to be calibrated on real networks.
+// Lambda presets express the cost in microseconds per MiB of reference
+// transfer for each unit of price per GiB. The numbers are initial values,
+// to be calibrated on real networks.
 const (
-	LambdaQuality  = 100
+	// LambdaQuality gives the least weight to price.
+	LambdaQuality = 100
+	// LambdaBalanced is the default price weight.
 	LambdaBalanced = 1000
-	LambdaSaving   = 10000
+	// LambdaSaving gives the most weight to price.
+	LambdaSaving = 10000
 )
 
 // scarcityUsPerMiB is the exhaustion cost of one unit of scarcity
@@ -81,8 +84,8 @@ const scarcityUsPerMiB = 10_000
 // maxScarcity bounds the scarcity weight (in 1/1000) below exhaustion.
 const maxScarcity = 64_000
 
-// MinElapsedPPM is the least elapsed share of a period Progress divides
-// by: a period that has just begun does not jump the cost.
+// MinElapsedPPM is the minimum elapsed fraction [Progress] divides by.
+// It limits the cost increase at the start of a period.
 const MinElapsedPPM = 1_000_000 / 30
 
 // Fee is the configured cost of an edge's bytes per MiB (µs): λ × the
@@ -204,8 +207,8 @@ func (l Link) throughput(c Class) float64 {
 }
 
 // Throughput is the effective throughput of l (bytes/s): the Mathis
-// bound for its RTT and loss, capped by its measured rate. No loss and no
-// rate is unbounded (math.MaxFloat64).
+// bound for its RTT and loss, capped by its measured rate. If both loss
+// and rate are zero, it returns math.MaxFloat64.
 func (l Link) Throughput() float64 { return l.throughput(Interactive) }
 
 // Edge is the cost of l alone for class c (µs, at least 1).

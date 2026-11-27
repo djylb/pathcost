@@ -1,6 +1,7 @@
 package pathcost
 
 import (
+	"errors"
 	"go/build"
 	"go/parser"
 	"go/token"
@@ -74,7 +75,7 @@ func publicStdlib(imp string) bool {
 		dir = filepath.Join(dir, part)
 	}
 	pkg, err := ctxt.ImportDir(dir, 0)
-	if _, excluded := err.(*build.NoGoError); excluded {
+	if _, excluded := errors.AsType[*build.NoGoError](err); excluded {
 		ctxt.UseAllFiles = true // a package for another target, such as syscall/js
 		pkg, err = ctxt.ImportDir(dir, 0)
 	}

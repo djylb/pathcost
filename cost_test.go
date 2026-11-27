@@ -45,8 +45,14 @@ func TestTerms(t *testing.T) {
 	if got := Edge(priced, Interactive); got != 10_031 {
 		t.Fatalf("interactive fee: %d", got)
 	}
-	if got := Edge(Link{RTTus: 10_000, Fee: FeeOf(LambdaSaving, 2, 0, false)}, Bulk); got != 10_000+160_000 {
-		t.Fatalf("saving λ: %d", got)
+	for _, tc := range []struct{ lambda, want uint64 }{
+		{LambdaQuality, 11_600},
+		{LambdaBalanced, 26_000},
+		{LambdaSaving, 170_000},
+	} {
+		if got := Edge(Link{RTTus: 10_000, Fee: FeeOf(tc.lambda, 2, 0, false)}, Bulk); got != tc.want {
+			t.Errorf("bulk cost with λ=%d: got %d, want %d", tc.lambda, got, tc.want)
+		}
 	}
 	if Edge(Link{RTTus: 10_000, Fee: Fee{}}, Bulk) != Edge(base, Bulk) {
 		t.Fatal("no unit price must cost 0")
@@ -145,7 +151,8 @@ func TestCheaper(t *testing.T) {
 }
 func TestArithmeticBoundaries(t *testing.T) {
 	h := Hysteresis{}
-	if h.Better(100, 100) || h.Pushed(100, 100) || CheaperBy(101, 100, 101) || Moved(1<<63-1, 1<<63, 50) || !Moved(0, 1<<63, 50) {
+	const high = uint64(1) << 63
+	if h.Better(100, 100) || h.Pushed(100, 100) || CheaperBy(101, 100, 101) || Moved(high-1, high, 50) || !Moved(0, high, 50) {
 		t.Fatal("percentage boundary")
 	}
 	links := make([]Link, 16384)
