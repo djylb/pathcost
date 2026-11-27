@@ -1,7 +1,7 @@
 # AGENTS.md
 
 - Before you finish, `gofmt -l .` must print nothing and `go vet ./...`,
-  `go test -race ./...` must pass, in the root and in `standalone/`. Give
+  `go test -race ./...` must pass, in the root and in `cmd/pathsim/`. Give
   every test run a `-timeout`.
 - Standard library only, also for tests; `deps_test.go` checks it.
 - `pathcost`, `route` and `probe` are pure: no clock, no IO, no

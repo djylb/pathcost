@@ -7,32 +7,98 @@ import (
 	"math/rand/v2"
 	"slices"
 	"testing"
+
+	"github.com/djylb/pathcost"
 )
 
 const now = 1_000_000
 
 // topo creates n active transit nodes with IDs from 1 to n and the demands ds.
 func topo(n int, ds ...Demand) *Topo {
-	t := &Topo{Nodes: map[NodeID]Node{}, Cover: map[Edge]Cover{}, Demand: SortDemand(ds)}
+	t := Topo{Nodes: map[NodeID]Node{}, Cover: map[Edge]Cover{}, Demand: SortDemand(ds)}
 	for i := NodeID(1); i <= NodeID(n); i++ {
 		t.Nodes[i] = Node{ID: i, Active: true, Transit: true}
 	}
-	t.Norm()
-	return t
+	return new(t.Norm())
+}
+
+func TestTopoNormReturnsCopy(t *testing.T) {
+	input := Topo{MaxHops: -1, Candidates: 2, Switch: pathcost.Hysteresis{GainPct: 101}}
+	before := input
+	got := input.Norm()
+	if !input.Equal(&before) {
+		t.Fatal("Norm changed its receiver")
+	}
+	if got.MaxHops != DefaultMaxHops || got.Candidates != 2 || got.RelayProbe != DefaultRelayProbe ||
+		got.ProbeIntervalMS != DefaultProbeIntervalMS || got.Switch != before.Switch.Norm() {
+		t.Fatalf("unexpected normalized settings: %+v", got)
+	}
+}
+
+func TestEdgeEndpoints(t *testing.T) {
+	e := MakeEdge(2, 1)
+	if e.Side(1) != 0 || e.Side(2) != 1 || e.Other(1) != 2 || e.Other(2) != 1 {
+		t.Fatalf("unexpected endpoint order: %v", e)
+	}
+	t.Run("Side", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Error("Side accepted a non-endpoint")
+			}
+		}()
+		e.Side(3)
+	})
+	t.Run("Other", func(t *testing.T) {
+		defer func() {
+			if recover() == nil {
+				t.Error("Other accepted a non-endpoint")
+			}
+		}()
+		e.Other(3)
+	})
+}
+
+func TestPathTableEdge(t *testing.T) {
+	active, stale, absent := MakeEdge(1, 2), MakeEdge(1, 3), MakeEdge(2, 3)
+	lt := LinkTable{stale: {}}
+	up(lt, 1, 2, 2000)
+	in := Inputs{Topo: topo(3), Links: lt, Now: now}
+	pt, _ := Compute(in, nil, true)
+
+	state, ok := pt.Edge(active)
+	cost, usable, known := EdgeCost(in, active)
+	if !ok || !known || !usable || !state.Usable || !state.Available || state.Cost != cost ||
+		state.Directions[active.Side(1)].RTTus != 2000 {
+		t.Fatalf("unexpected edge state: %+v, present=%t", state, ok)
+	}
+	original := state
+	state.Directions[active.Side(1)].RTTus++
+	if got, _ := pt.Edge(active); got != original {
+		t.Fatalf("editing returned state changed the snapshot: %+v", got)
+	}
+	if got, ok := pt.Edge(stale); !ok || got != (EdgeState{}) {
+		t.Fatalf("stale edge: %+v, present=%t", got, ok)
+	}
+	if got, ok := pt.Edge(absent); ok || got != (EdgeState{}) {
+		t.Fatalf("absent edge: %+v, present=%t", got, ok)
+	}
+	if got, ok := (*PathTable)(nil).Edge(active); ok || got != (EdgeState{}) {
+		t.Fatalf("nil table: %+v, present=%t", got, ok)
+	}
 }
 
 // Up reports a and b up with rtt (µs) from a's side.
 func up(lt LinkTable, a, b NodeID, rtt uint32) {
 	e := MakeEdge(a, b)
 	s := lt[e]
-	s[Side(e, a)] = LinkMeas{Up: true, RTTus: rtt, At: now}
+	s[e.Side(a)] = LinkMeas{Up: true, RTTus: rtt, At: now}
 	lt[e] = s
 }
 
 func down(lt LinkTable, a, b NodeID) {
 	e := MakeEdge(a, b)
 	s := lt[e]
-	s[Side(e, a)] = LinkMeas{Up: false, At: now}
+	s[e.Side(a)] = LinkMeas{Up: false, At: now}
 	lt[e] = s
 }
 
@@ -210,9 +276,9 @@ func TestDeterministic(t *testing.T) {
 		lt2 := LinkTable{}
 		maps.Copy(lt2, lt)
 		pt, _ := Compute(Inputs{Topo: tp, Links: lt2, Now: now}, nil, true)
-		pt.Used = nil
+		pt.used = nil
 		p0, _ := Compute(Inputs{Topo: tp, Links: lt, Now: now}, nil, true)
-		p0.Used = nil
+		p0.used = nil
 		if fmt.Sprint(pt.BySrc, pt.Probe) != fmt.Sprint(p0.BySrc, p0.Probe) {
 			t.Fatal("non-deterministic")
 		}
@@ -239,7 +305,7 @@ func TestHysteresis(t *testing.T) {
 	}
 	up(lt, 1, 3, 1250) // relay 1100 is 12 % cheaper: kept, nothing pending
 	pt3, _ := Compute(Inputs{Topo: tp, Links: lt, Now: now, Changed: ch}, pt2, false)
-	if ps := set(t, pt3, 1, 3); !slices.Equal(ps.Paths[0].Hops, []NodeID{3}) || len(pt3.Pending) != 0 {
+	if ps := set(t, pt3, 1, 3); !slices.Equal(ps.Paths[0].Hops, []NodeID{3}) || len(pt3.pending) != 0 {
 		t.Fatalf("within 20 %%: %v %v", hops(ps), ps.Why)
 	}
 	up(lt, 1, 3, 1500) // relay 1100 is 27 % cheaper: pending for 3 periods
@@ -255,8 +321,8 @@ func TestHysteresis(t *testing.T) {
 	// the relay stops being cheaper inside the hold: the wait restarts
 	up(lt, 1, 3, 1100)
 	pt6, _ := Compute(Inputs{Topo: tp, Links: lt, Now: now + hold - 1, Changed: ch}, pt5, false)
-	if len(pt6.Pending) != 0 {
-		t.Fatalf("pending kept: %v", pt6.Pending)
+	if len(pt6.pending) != 0 {
+		t.Fatalf("pending kept: %v", pt6.pending)
 	}
 	up(lt, 1, 3, 1500)
 	pt7, _ := Compute(Inputs{Topo: tp, Links: lt, Now: now + hold, Changed: ch}, pt6, false)
@@ -264,7 +330,7 @@ func TestHysteresis(t *testing.T) {
 		t.Fatalf("restarted wait switched early: %v", hops(ps))
 	}
 	pt8, _ := Compute(Inputs{Topo: tp, Links: lt, Now: now + 2*hold}, pt7, false)
-	if ps := set(t, pt8, 1, 3); !slices.Equal(ps.Paths[0].Hops, []NodeID{2, 3}) || len(pt8.Pending) != 0 {
+	if ps := set(t, pt8, 1, 3); !slices.Equal(ps.Paths[0].Hops, []NodeID{2, 3}) || len(pt8.pending) != 0 {
 		t.Fatalf("after the hold: %v %v", hops(ps), ps.Why)
 	}
 }
@@ -318,7 +384,7 @@ func TestIncrementalDiff(t *testing.T) {
 				current := a.Paths[0].Hops
 				ok := g.pathAllowed(d.Src, current, nil) && g.pathUp(d.Src, current, false)
 				ac := g.interactivePath(d.Src, current).CostUs
-				_, waiting := inc.Pending[fmt.Sprintf("%d:%s", d.Src, d.Key())]
+				_, waiting := inc.pending[d.key()]
 				if !ok || !waiting && ac*100 > b.Paths[0].CostUs*100*100/(100-tp.Switch.GainPct)+100 {
 					t.Fatalf("round %d %v: inc first %v (%d, %v) vs full %v (%d)", round, d, a.Paths[0].Hops, ac, ok, b.Paths[0].Hops, b.Paths[0].CostUs)
 				}
@@ -352,8 +418,8 @@ func TestProbeClosure(t *testing.T) {
 	pt, _ = Compute(Inputs{Topo: tp, Links: lt, Now: now + tp.ProbeIntervalMS}, pt, true)
 	// usable: one relay per pair stays measured, taking turns by window
 	//: here the second by load order
-	if !slices.Equal(pt.Probe[1], []NodeID{2, 4}) || !slices.Equal(pt.Probe[2], []NodeID{4}) || len(pt.BadSince) != 0 {
-		t.Fatalf("usable again: %v %v", pt.Probe, pt.BadSince)
+	if !slices.Equal(pt.Probe[1], []NodeID{2, 4}) || !slices.Equal(pt.Probe[2], []NodeID{4}) || len(pt.badSince) != 0 {
+		t.Fatalf("usable again: %v %v", pt.Probe, pt.badSince)
 	}
 }
 

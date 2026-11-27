@@ -13,7 +13,7 @@ func meas(lt LinkTable, a, b NodeID, m LinkMeas) {
 	e := MakeEdge(a, b)
 	s := lt[e]
 	m.Up, m.At = true, now
-	s[Side(e, a)] = m
+	s[e.Side(a)] = m
 	lt[e] = s
 }
 

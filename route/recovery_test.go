@@ -119,8 +119,8 @@ func TestRecoveryDropsForbiddenPath(t *testing.T) {
 	f.topo.Cover[MakeEdge(1, 3)] = Cover{Mode: LinkForbid}
 	f.round(240_000)
 	ps := f.run(true, []NodeID{2, 3})
-	if len(f.table.Pending) != 0 || len(ps.Paths) != 1 {
-		t.Fatalf("forbidden path retained: %v, pending=%v", hops(ps), f.table.Pending)
+	if len(f.table.pending) != 0 || len(ps.Paths) != 1 {
+		t.Fatalf("forbidden path retained: %v, pending=%v", hops(ps), f.table.pending)
 	}
 }
 
@@ -144,7 +144,7 @@ func newRecoveryFixture(t *testing.T) *recoveryFixture {
 func (f *recoveryFixture) put(a, b NodeID, up bool, stamp int64, rtt, loss uint32) {
 	e := MakeEdge(a, b)
 	m := f.links[e]
-	m[Side(e, a)] = LinkMeas{Up: up, At: f.now, RTTus: rtt, ProbeAt: stamp, ProbeRTTus: rtt, LossPPM: loss}
+	m[e.Side(a)] = LinkMeas{Up: up, At: f.now, RTTus: rtt, ProbeAt: stamp, ProbeRTTus: rtt, LossPPM: loss}
 	f.links[e] = m
 }
 

@@ -29,8 +29,8 @@
 // Subpackages: route computes K candidate paths per demand over a
 // measured topology with hop limits, via and allow constraints,
 // hysteresis and incremental recomputation; probe turns probe outcomes
-// and transport statistics into link estimates. The standalone module
-// is a command-line simulator over both.
+// and transport statistics into link estimates. The pathsim command
+// is a simulator over both.
 //
 // Pure: no clock, no IO; standard library only.
 package pathcost

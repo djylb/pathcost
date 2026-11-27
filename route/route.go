@@ -13,9 +13,9 @@ import (
 
 // NodeID is a node id. Ids order the tie-breaks, so equal inputs give
 // equal outputs.
-type NodeID = int64
+type NodeID int64
 
-// Edge is an unordered node pair, A<B.
+// Edge is an unordered node pair with A <= B.
 type Edge struct{ A, B NodeID }
 
 // MakeEdge is the edge of a and b in either order.
@@ -26,16 +26,29 @@ func MakeEdge(a, b NodeID) Edge {
 	return Edge{a, b}
 }
 
-// Other returns the opposite endpoint. n must be an endpoint of e.
+// Other returns the opposite endpoint. It panics if n is outside e.
 func (e Edge) Other(n NodeID) NodeID {
-	if e.A == n {
+	if e.Side(n) == 0 {
 		return e.B
 	}
 	return e.A
 }
 
+// Side returns the index of n's report in [LinkTable]: 0 for A, 1 for B.
+// It panics if n is outside e.
+func (e Edge) Side(n NodeID) int {
+	switch n {
+	case e.A:
+		return 0
+	case e.B:
+		return 1
+	default:
+		panic("route: node is not an endpoint of the edge")
+	}
+}
+
 func (e Edge) String() string {
-	return strconv.FormatInt(e.A, 10) + "-" + strconv.FormatInt(e.B, 10)
+	return strconv.FormatInt(int64(e.A), 10) + "-" + strconv.FormatInt(int64(e.B), 10)
 }
 
 // LinkMeas is one end's report of a link.
@@ -70,14 +83,6 @@ type LinkMeas struct {
 
 // LinkTable holds both ends' reports per edge: [0] from A, [1] from B.
 type LinkTable map[Edge][2]LinkMeas
-
-// Side indexes the report from n. n must be an endpoint of e.
-func Side(e Edge, n NodeID) int {
-	if n == e.A {
-		return 0
-	}
-	return 1
-}
 
 // UplinkFee is the fee of an uplink end for the bytes it sends (Out) and
 // receives (In).
@@ -141,10 +146,12 @@ type Demand struct {
 	Allow []NodeID
 }
 
-// Key is the (destination, via, allow) key of d within its source.
-func (d Demand) Key() string {
+// key identifies a demand in the table's pending switches.
+func (d Demand) key() string {
 	var b strings.Builder
-	b.WriteString(strconv.FormatInt(d.Dst, 10))
+	b.WriteString(strconv.FormatInt(int64(d.Src), 10))
+	b.WriteByte(':')
+	b.WriteString(strconv.FormatInt(int64(d.Dst), 10))
 	if len(d.Via) > 0 {
 		appendNodeKey(&b, 'v', d.Via)
 	}
@@ -160,7 +167,7 @@ func appendNodeKey(b *strings.Builder, prefix byte, nodes []NodeID) {
 		if i > 0 {
 			b.WriteByte('.')
 		}
-		b.WriteString(strconv.FormatInt(n, 10))
+		b.WriteString(strconv.FormatInt(int64(n), 10))
 	}
 }
 
@@ -196,8 +203,9 @@ const (
 	DefaultProbeIntervalMS = 60_000
 )
 
-// Norm fills the zero (or negative) settings with the defaults.
-func (t *Topo) Norm() {
+// Norm returns a shallow copy with default settings filled in and Switch
+// normalized. The maps and slices are shared with t.
+func (t Topo) Norm() Topo {
 	if t.MaxHops <= 0 {
 		t.MaxHops = DefaultMaxHops
 	}
@@ -209,6 +217,7 @@ func (t *Topo) Norm() {
 	}
 	t.ProbeIntervalMS = boundedPeriods(t.ProbeIntervalMS, 1)
 	t.Switch = t.Switch.Norm()
+	return t
 }
 
 func (in Inputs) fresh(m LinkMeas) bool {
@@ -306,47 +315,57 @@ type PathSet struct {
 	// PreferFirst applies the first path to all flow classes after a
 	// failure, until an ordinary cost-based switch replaces it.
 	PreferFirst bool
-	// Why gives one diagnostic per path in the same order. Examples include
-	// "shortest", "realtime: cheapest for datagram flows", "bulk: cheapest
-	// for bulk flows", "diverse shared=N", and "kept: …".
+	// Why gives one human-readable diagnostic per path in the same order.
+	// The text is unstable and must not be parsed.
 	Why []string
 }
 
-// PathTable is the output: per source its sets by (Dst, Via), the peers
-// each source probes, and per-edge state the next computation carries.
+// PathTable is a read-only snapshot of path sets by source, the peers
+// each source probes, and the state carried into the next computation.
 type PathTable struct {
 	BySrc map[NodeID][]PathSet
 	Probe map[NodeID][]NodeID
 	// Gen grows when Compute marks at least one source as changed.
 	Gen uint64
-	// BadSince is when an edge of the demand closure was last seen
-	// usable→not (or first wanted); the relay probes start one probe
-	// interval later.
-	BadSince map[Edge]int64
-	// Used records the effective links priced in this generation.
-	Used map[Edge]EdgeState
-	// Pending are the switches waiting out the hysteresis by (src,
-	// demand key): either a cheaper path or the path that failed.
-	Pending map[string]Pending
 	// Recheck is the earliest time (ms) a pending switch is due; 0: none.
 	// The caller recomputes then.
 	Recheck int64
+
+	// badSince is when an edge of the demand closure was last seen
+	// usable→not (or first wanted); the relay probes start one probe
+	// interval later.
+	badSince map[Edge]int64
+	// used records the effective edge states in this snapshot.
+	used map[Edge]EdgeState
+	// pending holds switches keyed by demand: a cheaper path or a failed path.
+	pending map[string]pendingSwitch
 }
 
-// Pending is a first path waiting to replace the current one. Since is
+// pendingSwitch is a first path waiting to replace the current one. since is
 // when it became cheaper, or when the failed path was last seen down.
-type Pending struct {
-	Hops     []NodeID
-	Since    int64
+type pendingSwitch struct {
+	hops     []NodeID
+	since    int64
 	recovery *recovery
 }
 
 // EdgeState is an edge as one computation saw it.
 type EdgeState struct {
-	Directions [2]pathcost.Link
+	Directions [2]pathcost.Link // from A, from B
 	Cost       uint64
 	Usable     bool
 	Available  bool // the latest fresh report says Up
+}
+
+// Edge returns a copy of e's state. The bool reports whether the edge
+// was included in the snapshot, even if stale or unusable. A nil table
+// returns the zero state and false.
+func (t *PathTable) Edge(e Edge) (EdgeState, bool) {
+	if t == nil {
+		return EdgeState{}, false
+	}
+	state, ok := t.used[e]
+	return state, ok
 }
 
 // Set returns src's set for (dst, via) without an Allow limit.
@@ -432,6 +451,7 @@ func (in Inputs) link(from, to NodeID) (l pathcost.Link, up, lossDown, known boo
 		return l, false, false, true
 	}
 	sides := in.Links[e]
+	fromSide := e.Side(from)
 
 	var side *LinkMeas
 	var rates []uint64
@@ -449,14 +469,14 @@ func (in Inputs) link(from, to NodeID) (l pathcost.Link, up, lossDown, known boo
 		l.QueueUs = max(l.QueueUs, m.QueueUs)
 		l.NoDatagram = l.NoDatagram || m.NoDatagram
 		if m.Uplink != "" { // the reporter dialled: the other end's uplink
-			if i == Side(e, from) {
+			if i == fromSide {
 				toUp = m.Uplink
 			} else {
 				fromUp = m.Uplink
 			}
 		}
 		r := m.RateInBps // the to end's inbound
-		if i == Side(e, from) {
+		if i == fromSide {
 			r = m.RateOutBps
 		}
 		if r > 0 {
@@ -527,7 +547,7 @@ func (g *graph) pathLinks(src NodeID, p []NodeID) []pathcost.Link {
 	prev := src
 	for _, n := range p {
 		e := MakeEdge(prev, n)
-		ls = append(ls, g.edges[e].Directions[Side(e, prev)])
+		ls = append(ls, g.edges[e].Directions[e.Side(prev)])
 		prev = n
 	}
 	return ls

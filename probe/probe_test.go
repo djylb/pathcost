@@ -1,6 +1,7 @@
 package probe
 
 import (
+	"slices"
 	"testing"
 	"time"
 )
@@ -53,21 +54,39 @@ func TestSession(t *testing.T) {
 	}
 }
 
-func TestMoved(t *testing.T) {
-	o := Reading{Up: true, RTTus: 20_000}
-	if Moved(o, Reading{Up: true, RTTus: 23_000}) {
+func TestReportable(t *testing.T) {
+	old := Reading{Up: true, RTTus: 20_000}
+	if Reportable(old, Reading{Up: true, RTTus: 23_000}) {
 		t.Fatal("15 % moved")
 	}
-	if !Moved(o, Reading{Up: true, RTTus: 24_000}) || !Moved(o, Reading{RTTus: 20_000}) {
+	if !Reportable(old, Reading{Up: true, RTTus: 24_000}) || !Reportable(old, Reading{RTTus: 20_000}) {
 		t.Fatal("20 % or Up not moved")
 	}
-	if Moved(Reading{RTTus: 1000}, Reading{RTTus: 2900}) {
+	if Reportable(Reading{RTTus: 1000}, Reading{RTTus: 2900}) {
 		t.Fatal("below the floor")
 	}
-	if !Moved(o, Reading{Up: true, RTTus: 20_000, LossPPM: 600_000}) || !Moved(o, Reading{Up: true, RTTus: 20_000, RateInBps: 1}) {
+	if !Reportable(old, Reading{Up: true, RTTus: 20_000, LossPPM: 600_000}) || !Reportable(old, Reading{Up: true, RTTus: 20_000, RateInBps: 1}) {
 		t.Fatal("loss crossing / rate known")
 	}
-	if Median([]time.Duration{3, 1, 2}) != 2 || Rate(1000, time.Second/2) != 2000 {
+	newer := Reading{Up: true, RTTus: 24_000}
+	if Reportable(newer, old) {
+		t.Fatal("RTT change must use the old baseline")
+	}
+	slow := Reading{RateOutBps: 120, RateInBps: 120}
+	fast := Reading{RateOutBps: 200, RateInBps: 200}
+	if RateMoved(200, 120) || !RateMoved(120, 200) || Reportable(fast, slow) ||
+		!Reportable(slow, Reading{RateOutBps: 200, RateInBps: 120}) ||
+		!Reportable(slow, Reading{RateOutBps: 120, RateInBps: 200}) {
+		t.Fatal("rate change must use the old baseline")
+	}
+}
+
+func TestMedianPreservesInput(t *testing.T) {
+	rtts := []time.Duration{4, 1, 3, 2}
+	if Median(rtts) != 3 || !slices.Equal(rtts, []time.Duration{4, 1, 3, 2}) {
+		t.Fatalf("median changed its input: %v", rtts)
+	}
+	if Median(nil) != 0 || Rate(1000, time.Second/2) != 2000 {
 		t.Fatal("median/rate")
 	}
 }

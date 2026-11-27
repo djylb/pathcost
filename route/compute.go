@@ -6,7 +6,6 @@ import (
 	"maps"
 	"math"
 	"slices"
-	"strconv"
 
 	"github.com/djylb/pathcost"
 )
@@ -199,8 +198,7 @@ func (g *graph) viaOK(src, dst NodeID, via []NodeID) ([]NodeID, bool) {
 // path sets under [PathSet.Equal]. A diagnostic-only change to Why is ignored.
 // A changed effective link may introduce a new path for any demand.
 func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]struct{}) {
-	topo := *in.Topo
-	topo.Norm()
+	topo := in.Topo.Norm()
 	in.Topo = &topo
 	in.Now = max(in.Now, 0)
 	g := buildGraph(in)
@@ -211,9 +209,9 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 		full = true
 	} else if !full {
 		changed = maps.Clone(in.Changed)
-		for _, states := range []map[Edge]EdgeState{prev.Used, g.edges} {
+		for _, states := range []map[Edge]EdgeState{prev.used, g.edges} {
 			for e := range states {
-				if prev.Used[e] != g.edges[e] {
+				if prev.used[e] != g.edges[e] {
 					if changed == nil {
 						changed = map[Edge]struct{}{}
 					}
@@ -222,15 +220,15 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 			}
 		}
 	}
-	out := &PathTable{BySrc: map[NodeID][]PathSet{}, Used: g.edges, Pending: map[string]Pending{}}
+	out := &PathTable{BySrc: map[NodeID][]PathSet{}, used: g.edges, pending: map[string]pendingSwitch{}}
 	for _, d := range in.Topo.Demand {
 		old, _ := prev.SetOf(d)
-		key := switchKey(d)
-		p, waiting := prev.pending(key)
+		key := d.key()
+		p, waiting := prev.pendingFor(key)
 		recovering := p.recovery != nil
-		due := waiting && !recovering && in.Now-p.Since >= in.Topo.holdMS()
+		due := waiting && !recovering && in.Now-p.since >= in.Topo.holdMS()
 		g.allow = d.Allow
-		rebuild := full || due || g.affected(d, changed) || recovering && len(p.recovery.alternative.Hops) > 0
+		rebuild := full || due || g.affected(d, changed) || recovering && len(p.recovery.alternative.hops) > 0
 		if !rebuild && !recovering {
 			if len(old.Paths) > 0 {
 				out.BySrc[d.Src] = append(out.BySrc[d.Src], old)
@@ -247,14 +245,14 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 		var ps PathSet
 		if ps, p, recovering = g.recover(d, via, old, p, rebuild); recovering {
 			if p.recovery != nil {
-				out.Pending[key] = p
-				if q := p.recovery.alternative; len(q.Hops) > 0 {
+				out.pending[key] = p
+				if q := p.recovery.alternative; len(q.hops) > 0 {
 					out.recheck(q, in.Topo.holdMS())
 				}
 			}
 		} else {
 			ps, p = g.pathSet(d, via, old, p)
-			if len(p.Hops) > 0 {
+			if len(p.hops) > 0 {
 				out.wait(key, p, in.Topo.holdMS())
 			}
 		}
@@ -264,9 +262,9 @@ func Compute(in Inputs, prev *PathTable, full bool) (*PathTable, map[NodeID]stru
 	}
 	var bad map[Edge]int64
 	if prev != nil {
-		bad = prev.BadSince
+		bad = prev.badSince
 	}
-	out.Probe, out.BadSince = g.probe(bad, out)
+	out.Probe, out.badSince = g.probe(bad, out)
 	dirty := map[NodeID]struct{}{}
 	if prev == nil {
 		for s := range out.BySrc {
@@ -324,26 +322,24 @@ edges:
 	return false
 }
 
-// pending is the switch waiting for key in t; t may be nil.
-func (t *PathTable) pending(key string) (Pending, bool) {
+// pendingFor returns the switch waiting for key in t; t may be nil.
+func (t *PathTable) pendingFor(key string) (pendingSwitch, bool) {
 	if t == nil {
-		return Pending{}, false
+		return pendingSwitch{}, false
 	}
-	p, ok := t.Pending[key]
+	p, ok := t.pending[key]
 	return p, ok
 }
 
-func switchKey(d Demand) string { return strconv.FormatInt(d.Src, 10) + ":" + d.Key() }
-
-func (t *PathTable) wait(key string, p Pending, hold int64) {
-	t.Pending[key] = p
+func (t *PathTable) wait(key string, p pendingSwitch, hold int64) {
+	t.pending[key] = p
 	t.recheck(p, hold)
 }
-func (t *PathTable) recheck(p Pending, hold int64) {
-	if hold > math.MaxInt64-p.Since {
+func (t *PathTable) recheck(p pendingSwitch, hold int64) {
+	if hold > math.MaxInt64-p.since {
 		return
 	}
-	if at := p.Since + hold; t.Recheck == 0 || at < t.Recheck {
+	if at := p.since + hold; t.Recheck == 0 || at < t.Recheck {
 		t.Recheck = at
 	}
 }
@@ -374,38 +370,38 @@ func (g *graph) retained(src NodeID, hops []NodeID, winners [3]*Path) *Path {
 }
 
 // pathSet applies the cost hysteresis to ordinary path changes.
-func (g *graph) pathSet(d Demand, via []NodeID, old PathSet, p Pending) (PathSet, Pending) {
+func (g *graph) pathSet(d Demand, via []NodeID, old PathSet, p pendingSwitch) (PathSet, pendingSwitch) {
 	winners := g.winners(d, via)
 	build := func(pinned *Path) PathSet { return g.candidates(d, via, pinned, winners) }
 	best := winners[pathcost.Interactive]
 	if len(old.Paths) == 0 {
-		return build(nil), Pending{}
+		return build(nil), pendingSwitch{}
 	}
 	current := old.Paths[0].Hops
 	if !g.pathAllowed(d.Src, current, via) || !g.pathUp(d.Src, current, old.PreferFirst) {
-		return build(nil), Pending{}
+		return build(nil), pendingSwitch{}
 	}
 	if best == nil {
 		ps := build(g.retained(d.Src, current, winners))
 		ps.Why[0], ps.PreferFirst = "kept: previous path still available", true
-		return ps, Pending{}
+		return ps, pendingSwitch{}
 	}
 	if slices.Equal(current, best.Hops) {
 		ps := build(nil)
 		ps.PreferFirst = old.PreferFirst
-		return ps, Pending{}
+		return ps, pendingSwitch{}
 	}
 	pinned := g.retained(d.Src, current, winners)
 	oc := pinned.CostUs
-	var pending Pending
+	var pending pendingSwitch
 	if g.in.Topo.Switch.Better(best.CostUs, oc) {
-		if !slices.Equal(p.Hops, best.Hops) {
-			p = Pending{Hops: best.Hops, Since: g.in.Now}
+		if !slices.Equal(p.hops, best.Hops) {
+			p = pendingSwitch{hops: best.Hops, since: g.in.Now}
 		}
-		if g.in.Now-p.Since >= g.in.Topo.holdMS() {
+		if g.in.Now-p.since >= g.in.Topo.holdMS() {
 			ps := build(nil)
-			ps.Why[0] = fmt.Sprintf("shortest: %d%% cheaper than the previous first for %d ms", 100-best.CostUs*100/max(oc, 1), g.in.Now-p.Since)
-			return ps, Pending{}
+			ps.Why[0] = fmt.Sprintf("shortest: %d%% cheaper than the previous first for %d ms", 100-best.CostUs*100/max(oc, 1), g.in.Now-p.since)
+			return ps, pendingSwitch{}
 		}
 		pending = p
 	}
@@ -512,7 +508,7 @@ func (g *graph) probe(prevBad map[Edge]int64, paths *PathTable) (map[NodeID][]No
 	// Every hop of both paths needs comparable RTT while recovering.
 	// Keep these pairs in the list even when ordinary relay probes rotate.
 	for _, d := range t.Demand {
-		p := paths.Pending[switchKey(d)]
+		p := paths.pending[d.key()]
 		if p.recovery == nil {
 			continue
 		}
@@ -523,7 +519,7 @@ func (g *graph) probe(prevBad map[Edge]int64, paths *PathTable) (map[NodeID][]No
 				src = n
 			}
 		}
-		addPath(p.Hops)
+		addPath(p.hops)
 		if ps, ok := paths.SetOf(d); ok {
 			addPath(ps.Paths[0].Hops)
 		}

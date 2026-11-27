@@ -149,10 +149,17 @@ func TestCheaper(t *testing.T) {
 		t.Fatal("gain")
 	}
 }
+
+func TestMovedUsesOldBaseline(t *testing.T) {
+	if Moved(200, 120, 50) || !Moved(120, 200, 50) || !Moved(200, 100, 50) {
+		t.Fatal("movement must be measured relative to the old cost")
+	}
+}
+
 func TestArithmeticBoundaries(t *testing.T) {
 	h := Hysteresis{}
 	const high = uint64(1) << 63
-	if h.Better(100, 100) || h.Pushed(100, 100) || CheaperBy(101, 100, 101) || Moved(high-1, high, 50) || !Moved(0, high, 50) {
+	if h.Better(100, 100) || h.Pushed(100, 100) || CheaperBy(101, 100, 101) || Moved(high, high-1, 50) || !Moved(high, 0, 50) || !Moved(0, high, 50) {
 		t.Fatal("percentage boundary")
 	}
 	links := make([]Link, 16384)

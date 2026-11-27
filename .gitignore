@@ -28,5 +28,8 @@ go.work.sum
 .idea/
 .vscode/
 
+# macOS
+.DS_Store
+
 # Local working documents
 docs/

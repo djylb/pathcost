@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+
+	"github.com/djylb/pathcost/route"
 )
 
 func runOut(t *testing.T, stdin string, args ...string) string {
@@ -108,13 +110,13 @@ func TestFinalFlushAndInvalidInputs(t *testing.T) {
 }
 func TestMultipleFinalDeadlines(t *testing.T) {
 	sc := Scenario{ProbeIntervalMS: 1000}
-	for i := int64(1); i <= 6; i++ {
+	for i := route.NodeID(1); i <= 6; i++ {
 		sc.Nodes = append(sc.Nodes, NodeJSON{ID: i})
 	}
-	for i := int64(1); i <= 4; i += 3 {
+	for i := route.NodeID(1); i <= 4; i += 3 {
 		sc.Demand = append(sc.Demand, DemandJSON{Src: i, Dst: i + 2})
 		sc.Links = append(sc.Links, LinkJSON{A: i, B: i + 2, RTTms: 10}, LinkJSON{A: i, B: i + 1, RTTms: 20}, LinkJSON{A: i + 1, B: i + 2, RTTms: 20})
-		sc.Steps = append(sc.Steps, StepJSON{AtMS: 100 + (i-1)/3*100, Links: []LinkJSON{{A: i, B: i + 2, RTTms: 100}}})
+		sc.Steps = append(sc.Steps, StepJSON{AtMS: 100 + int64(i-1)/3*100, Links: []LinkJSON{{A: i, B: i + 2, RTTms: 100}}})
 	}
 	switches := func() []int64 {
 		var out bytes.Buffer

@@ -207,8 +207,8 @@ func (l Link) throughput(c Class) float64 {
 }
 
 // Throughput is the effective throughput of l (bytes/s): the Mathis
-// bound for its RTT and loss, capped by its measured rate. If both loss
-// and rate are zero, it returns math.MaxFloat64.
+// bound for its RTT and loss, capped by its measured rate. It returns
+// [math.MaxFloat64] for unconstrained throughput (zero loss and rate).
 func (l Link) Throughput() float64 { return l.throughput(Interactive) }
 
 // Edge is the cost of l alone for class c (µs, at least 1).

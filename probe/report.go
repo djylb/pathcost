@@ -20,26 +20,24 @@ type Reading struct {
 	RateOutBps, RateInBps uint64
 }
 
-// Moved reports n worth reporting after o (the report thresholds).
-func Moved(o, n Reading) bool {
-	return o.Up != n.Up || delayMoved(n.RTTus, o.RTTus) || delayMoved(n.QueueUs, o.QueueUs) ||
-		(o.LossPPM >= pathcost.LossDown) != (n.LossPPM >= pathcost.LossDown) ||
-		RateMoved(n.RateOutBps, o.RateOutBps) || RateMoved(n.RateInBps, o.RateInBps)
+// Reportable reports whether new is worth reporting after old under the report thresholds.
+func Reportable(old, new Reading) bool {
+	return old.Up != new.Up || delayMoved(old.RTTus, new.RTTus) || delayMoved(old.QueueUs, new.QueueUs) ||
+		(old.LossPPM >= pathcost.LossDown) != (new.LossPPM >= pathcost.LossDown) ||
+		RateMoved(old.RateOutBps, new.RateOutBps) || RateMoved(old.RateInBps, new.RateInBps)
 }
 
-func delayMoved(n, o uint32) bool {
-	d := int64(n) - int64(o)
+func delayMoved(old, new uint32) bool {
+	d := int64(new) - int64(old)
 	if d < 0 {
 		d = -d
 	}
-	return d >= ReportFloorUs && pathcost.Moved(uint64(n), uint64(o), ReportRTTPct)
+	return d >= ReportFloorUs && pathcost.Moved(uint64(old), uint64(new), ReportRTTPct)
 }
 
-// RateMoved reports a rate change worth a report: known ↔ unknown, or a
-// move of ReportRatePct.
-func RateMoved(n, o uint64) bool {
-	if (n == 0) != (o == 0) {
-		return true
-	}
-	return o > 0 && pathcost.Moved(n, o, ReportRatePct)
+// RateMoved reports whether the rate changed from known to unknown or
+// vice versa, or moved by at least ReportRatePct relative to old.
+// A zero rate is unknown.
+func RateMoved(old, new uint64) bool {
+	return pathcost.Moved(old, new, ReportRatePct)
 }

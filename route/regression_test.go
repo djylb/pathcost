@@ -52,7 +52,7 @@ func TestSharedTopologyAndDemandIdentity(t *testing.T) {
 		before := *tp
 		lt := LinkTable{}
 		up(lt, 1, 2, 1000)
-		if len(tp.Demand) != 2 || a.Key() == b.Key() {
+		if len(tp.Demand) != 2 || a.key() == b.key() {
 			t.Fatal(tp.Demand)
 		}
 		var wg sync.WaitGroup
@@ -123,8 +123,8 @@ func TestThirdPathDuringRecovery(t *testing.T) {
 	in.Now = pt.Recheck
 	pt, _ = Compute(in, pt, false)
 	ps := set(t, pt, 1, 4)
-	if !slices.Equal(ps.Paths[0].Hops, []NodeID{3, 4}) || ps.PreferFirst || len(pt.Pending) != 1 {
-		t.Fatal(ps, pt.Pending)
+	if !slices.Equal(ps.Paths[0].Hops, []NodeID{3, 4}) || ps.PreferFirst || len(pt.pending) != 1 {
+		t.Fatal(ps, pt.pending)
 	}
 }
 

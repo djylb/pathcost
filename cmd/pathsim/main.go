@@ -24,7 +24,7 @@ import (
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout); err != nil {
 		// The command is already failing and stderr is its diagnostic stream.
-		_, _ = fmt.Fprintln(os.Stderr, "standalone:", err)
+		_, _ = fmt.Fprintln(os.Stderr, "pathsim:", err)
 		os.Exit(1)
 	}
 }
@@ -53,44 +53,44 @@ type SwitchJSON struct {
 
 // NodeJSON is one node; every node is active.
 type NodeJSON struct {
-	ID         int64  `json:"id"`
-	NoTransit  bool   `json:"no_transit,omitempty"`
-	BiasUs     int64  `json:"bias_us,omitempty"`
-	PriceIn    uint64 `json:"price_in,omitempty"`  // unit price per GiB received
-	PriceOut   uint64 `json:"price_out,omitempty"` // unit price per GiB sent
-	QuotaUsed  uint64 `json:"quota_used,omitempty"`
-	Quota      uint64 `json:"quota,omitempty"`       // bytes per period; 0 none
-	ElapsedPPM uint32 `json:"elapsed_ppm,omitempty"` // share of the period gone
+	ID         route.NodeID `json:"id"`
+	NoTransit  bool         `json:"no_transit,omitempty"`
+	BiasUs     int64        `json:"bias_us,omitempty"`
+	PriceIn    uint64       `json:"price_in,omitempty"`  // unit price per GiB received
+	PriceOut   uint64       `json:"price_out,omitempty"` // unit price per GiB sent
+	QuotaUsed  uint64       `json:"quota_used,omitempty"`
+	Quota      uint64       `json:"quota,omitempty"`       // bytes per period; 0 none
+	ElapsedPPM uint32       `json:"elapsed_ppm,omitempty"` // share of the period gone
 }
 
 // PairJSON is a node pair override.
 type PairJSON struct {
-	A         int64  `json:"a"`
-	B         int64  `json:"b"`
-	Mode      string `json:"mode,omitempty"` // auto, must, forbid
-	BiasUs    int64  `json:"bias_us,omitempty"`
-	Exhausted bool   `json:"exhausted,omitempty"`
+	A         route.NodeID `json:"a"`
+	B         route.NodeID `json:"b"`
+	Mode      string       `json:"mode,omitempty"` // auto, must, forbid
+	BiasUs    int64        `json:"bias_us,omitempty"`
+	Exhausted bool         `json:"exhausted,omitempty"`
 }
 
 // LinkJSON is a measurement of a→b (both ends report symmetric rates).
 type LinkJSON struct {
-	A          int64   `json:"a"`
-	B          int64   `json:"b"`
-	Down       bool    `json:"down,omitempty"`
-	RTTms      float64 `json:"rtt_ms"`
-	LossPct    float64 `json:"loss_pct,omitempty"`
-	RateMbps   float64 `json:"rate_mbps,omitempty"`
-	QueueMs    float64 `json:"queue_ms,omitempty"`
-	NoDatagram bool    `json:"no_datagram,omitempty"`
-	Remove     bool    `json:"remove,omitempty"`
+	A          route.NodeID `json:"a"`
+	B          route.NodeID `json:"b"`
+	Down       bool         `json:"down,omitempty"`
+	RTTms      float64      `json:"rtt_ms"`
+	LossPct    float64      `json:"loss_pct,omitempty"`
+	RateMbps   float64      `json:"rate_mbps,omitempty"`
+	QueueMs    float64      `json:"queue_ms,omitempty"`
+	NoDatagram bool         `json:"no_datagram,omitempty"`
+	Remove     bool         `json:"remove,omitempty"`
 }
 
 // DemandJSON is one demand.
 type DemandJSON struct {
-	Src   int64   `json:"src"`
-	Dst   int64   `json:"dst"`
-	Via   []int64 `json:"via,omitempty"`
-	Allow []int64 `json:"allow,omitempty"`
+	Src   route.NodeID   `json:"src"`
+	Dst   route.NodeID   `json:"dst"`
+	Via   []route.NodeID `json:"via,omitempty"`
+	Allow []route.NodeID `json:"allow,omitempty"`
 }
 
 // StepJSON changes measurements at a time (ms from the start).
@@ -100,7 +100,7 @@ type StepJSON struct {
 }
 
 func run(args []string, stdin io.Reader, stdout io.Writer) error {
-	fs := flag.NewFlagSet("standalone", flag.ContinueOnError)
+	fs := flag.NewFlagSet("pathsim", flag.ContinueOnError)
 	fs.SetOutput(stdout)
 	asJSON := fs.Bool("json", false, "print JSON lines instead of text")
 	replay := fs.Bool("replay", false, "replay a probe trace instead of a scenario")
@@ -108,7 +108,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		return err
 	}
 	if fs.NArg() != 1 {
-		return errors.New("usage: standalone [-json] scenario.json | -replay trace.txt (\"-\": stdin)")
+		return errors.New("usage: pathsim [-json] scenario.json | -replay trace.txt (\"-\": stdin)")
 	}
 	in := stdin
 	if p := fs.Arg(0); p != "-" {
@@ -163,7 +163,7 @@ func (r *scenarioReader) Read(p []byte) (int, error) {
 
 // Topo is the route topology of sc.
 func (sc *Scenario) Topo() (*route.Topo, error) {
-	t := &route.Topo{Nodes: map[route.NodeID]route.Node{}, Cover: map[route.Edge]route.Cover{},
+	t := route.Topo{Nodes: map[route.NodeID]route.Node{}, Cover: map[route.Edge]route.Cover{},
 		MaxHops: sc.MaxHops, Candidates: sc.Candidates, ProbeIntervalMS: sc.ProbeIntervalMS,
 		Switch: pathcost.Hysteresis{GainPct: sc.Switch.GainPct, Hold: sc.Switch.Hold}}
 	for _, n := range sc.Nodes {
@@ -206,7 +206,7 @@ func (sc *Scenario) Topo() (*route.Topo, error) {
 	}
 	var ds []route.Demand
 	for _, d := range sc.Demand {
-		for _, group := range [][]int64{{d.Src, d.Dst}, d.Allow, d.Via} {
+		for _, group := range [][]route.NodeID{{d.Src, d.Dst}, d.Allow, d.Via} {
 			for _, id := range group {
 				if !t.Nodes[id].Active {
 					return nil, fmt.Errorf("demand %d->%d: unknown node %d", d.Src, d.Dst, id)
@@ -247,11 +247,10 @@ func (sc *Scenario) Topo() (*route.Topo, error) {
 		}
 	}
 	t.Demand = route.SortDemand(ds)
-	t.Norm()
-	return t, nil
+	return new(t.Norm()), nil
 }
 
-func sorted(s []int64) []int64 {
+func sorted(s []route.NodeID) []route.NodeID {
 	if s == nil {
 		return nil
 	}
@@ -292,13 +291,13 @@ func apply(lt route.LinkTable, ls []LinkJSON, now int64) []route.Edge {
 
 // event is one line of the output.
 type event struct {
-	Allow       []int64        `json:"allow"`
+	Allow       []route.NodeID `json:"allow"`
 	PreferFirst bool           `json:"prefer_first"`
 	AtMS        int64          `json:"at_ms"`
 	Kind        string         `json:"kind"` // paths, switch
-	Src         int64          `json:"src"`
-	Dst         int64          `json:"dst"`
-	Via         []int64        `json:"via,omitempty"`
+	Src         route.NodeID   `json:"src"`
+	Dst         route.NodeID   `json:"dst"`
+	Via         []route.NodeID `json:"via,omitempty"`
 	Paths       []pathJSON     `json:"paths,omitempty"`
 	From        []route.NodeID `json:"from,omitempty"`
 	To          []route.NodeID `json:"to,omitempty"`

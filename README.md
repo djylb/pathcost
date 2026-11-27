@@ -44,12 +44,19 @@ order candidates by flow class.
 
 ## Simulator
 
-Run the command-line simulator from its separate [`standalone/` module](standalone/).
+Install the simulator with Go:
 
+```sh
+go install github.com/djylb/pathcost/cmd/pathsim@latest
 ```
-cd standalone
-go run . testdata/degrade.json        # text; -json for JSON lines
-go run . -replay trace.txt            # lines: <ms> <rtt_ms>|lost
+
+To install from a checkout, run `go install .` in [`cmd/pathsim`](cmd/pathsim).
+Run it with a scenario or a probe trace:
+
+```sh
+pathsim scenario.json
+pathsim -json scenario.json           # JSON lines
+pathsim -replay trace.txt              # lines: <ms> <rtt_ms>|lost
 ```
 
 A scenario lists nodes (transit, bias, unit prices, quota), pair
@@ -59,8 +66,7 @@ the candidate paths with their costs per class and every switch of a
 first path.
 
 The scenario's `switch` object accepts `gain_pct` and `hold`. Zero selects
-the default for either field. Remove `push_pct` from existing scenarios,
-including `"push_pct": 0`, before running them.
+the default for either field.
 
 Replay timestamps are nonnegative integer milliseconds. Each RTT is in
 milliseconds and must be at least one nanosecond (`0.000001` ms). Use `lost` for

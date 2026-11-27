@@ -163,12 +163,13 @@ func (e *Estimator) Link() pathcost.Link {
 	return pathcost.Link{RTTus: e.srtt, LossPPM: e.LossPPM(), QueueUs: e.queue}
 }
 
-// Median is the median of rtts (the round trip of a probe of several
-// calls); 0 for none. rtts is sorted in place.
+// Median returns the middle sorted RTT, or the upper middle for an even
+// number of samples. It returns 0 for an empty slice and leaves rtts unchanged.
 func Median(rtts []time.Duration) time.Duration {
 	if len(rtts) == 0 {
 		return 0
 	}
+	rtts = slices.Clone(rtts)
 	slices.Sort(rtts)
 	return rtts[len(rtts)/2]
 }

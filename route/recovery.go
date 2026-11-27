@@ -10,17 +10,17 @@ import (
 // Allow for staggered peer probes while bounding the age of a round.
 const recoveryProbeAgePeriods = 2
 
-// recovery is the evidence for returning to Pending.Hops after an outage.
+// recovery is the evidence for returning to the path that failed.
 // Each hop on both paths must have a new observation to complete a round.
 type recovery struct {
-	alternative Pending
+	alternative pendingSwitch
 	rounds      uint64
 	samples     []int64
 }
 
 // recover handles a first path lost to an outage, preserving its identity
 // even when it drops out of the candidate set or no fallback is available.
-func (g *graph) recover(d Demand, via []NodeID, old PathSet, p Pending, rebuild bool) (PathSet, Pending, bool) {
+func (g *graph) recover(d Demand, via []NodeID, old PathSet, p pendingSwitch, rebuild bool) (PathSet, pendingSwitch, bool) {
 	var current []NodeID
 	if len(old.Paths) > 0 {
 		current = old.Paths[0].Hops
@@ -31,19 +31,19 @@ func (g *graph) recover(d Demand, via []NodeID, old PathSet, p Pending, rebuild 
 		if usable || !allowed {
 			return PathSet{}, p, false
 		}
-		p = Pending{Hops: current, Since: g.in.Now, recovery: &recovery{}}
-	} else if !g.pathAllowed(d.Src, p.Hops, via) {
-		return PathSet{}, Pending{}, false
+		p = pendingSwitch{hops: current, since: g.in.Now, recovery: &recovery{}}
+	} else if !g.pathAllowed(d.Src, p.hops, via) {
+		return PathSet{}, pendingSwitch{}, false
 	}
-	available := g.pathUp(d.Src, p.Hops, true)
+	available := g.pathUp(d.Src, p.hops, true)
 	if !available {
-		p.Since, p.recovery = g.in.Now, &recovery{alternative: p.recovery.alternative}
+		p.since, p.recovery = g.in.Now, &recovery{alternative: p.recovery.alternative}
 	}
 
 	if !usable {
 		if available {
-			ps := g.recoveredSet(d, via, p.Hops, "recovered: previous path available while current path is down")
-			return ps, Pending{}, true
+			ps := g.recoveredSet(d, via, p.hops, "recovered: previous path available while current path is down")
+			return ps, pendingSwitch{}, true
 		}
 		ps := g.candidates(d, via, nil, g.winners(d, via))
 		ps.PreferFirst = len(ps.Paths) > 0
@@ -55,15 +55,15 @@ func (g *graph) recover(d Demand, via []NodeID, old PathSet, p Pending, rebuild 
 		var ready bool
 		p, ready = g.recoveryRound(d.Src, current, p)
 		if ready {
-			ps := g.recoveredSet(d, via, p.Hops, fmt.Sprintf("recovered: RTT at least %d%% lower for %d new probe rounds", g.in.Topo.Switch.GainPct, g.in.Topo.Switch.Hold))
-			return ps, Pending{}, true
+			ps := g.recoveredSet(d, via, p.hops, fmt.Sprintf("recovered: RTT at least %d%% lower for %d new probe rounds", g.in.Topo.Switch.GainPct, g.in.Topo.Switch.Hold))
+			return ps, pendingSwitch{}, true
 		}
 	}
 	if !rebuild {
 		// Probe evidence can change without changing any effective link.
 		return old, p, true
 	}
-	g.excluded = p.Hops
+	g.excluded = p.hops
 	ps, alt := g.pathSet(d, via, old, p.recovery.alternative)
 	g.excluded = nil
 	r := *p.recovery
@@ -83,11 +83,11 @@ func (g *graph) recoveredSet(d Demand, via, hops []NodeID, why string) PathSet {
 	return ps
 }
 
-func (g *graph) recoveryRound(src NodeID, current []NodeID, p Pending) (Pending, bool) {
+func (g *graph) recoveryRound(src NodeID, current []NodeID, p pendingSwitch) (pendingSwitch, bool) {
 	r := *p.recovery
-	stamps := make([]int64, 0, len(p.Hops)+len(current))
-	cand, stamps := g.probedPath(src, p.Hops, p.Since, stamps)
-	cur, stamps := g.probedPath(src, current, p.Since, stamps)
+	stamps := make([]int64, 0, len(p.hops)+len(current))
+	cand, stamps := g.probedPath(src, p.hops, p.since, stamps)
+	cur, stamps := g.probedPath(src, current, p.since, stamps)
 	if cand == 0 || cur == 0 {
 		r.rounds = 0
 		p.recovery = &r
