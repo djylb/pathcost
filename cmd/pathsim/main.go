@@ -54,13 +54,13 @@ type SwitchJSON struct {
 // NodeJSON is one node; every node is active.
 type NodeJSON struct {
 	ID         route.NodeID `json:"id"`
-	NoTransit  bool         `json:"no_transit,omitempty"`
 	BiasUs     int64        `json:"bias_us,omitempty"`
 	PriceIn    uint64       `json:"price_in,omitempty"`  // unit price per GiB received
 	PriceOut   uint64       `json:"price_out,omitempty"` // unit price per GiB sent
 	QuotaUsed  uint64       `json:"quota_used,omitempty"`
 	Quota      uint64       `json:"quota,omitempty"`       // bytes per period; 0 none
 	ElapsedPPM uint32       `json:"elapsed_ppm,omitempty"` // share of the period gone
+	NoTransit  bool         `json:"no_transit,omitempty"`
 }
 
 // PairJSON is a node pair override.
@@ -76,11 +76,11 @@ type PairJSON struct {
 type LinkJSON struct {
 	A          route.NodeID `json:"a"`
 	B          route.NodeID `json:"b"`
-	Down       bool         `json:"down,omitempty"`
 	RTTms      float64      `json:"rtt_ms"`
 	LossPct    float64      `json:"loss_pct,omitempty"`
 	RateMbps   float64      `json:"rate_mbps,omitempty"`
 	QueueMs    float64      `json:"queue_ms,omitempty"`
+	Down       bool         `json:"down,omitempty"`
 	NoDatagram bool         `json:"no_datagram,omitempty"`
 	Remove     bool         `json:"remove,omitempty"`
 }

@@ -53,10 +53,7 @@ func (e Edge) String() string {
 
 // LinkMeas is one end's report of a link.
 type LinkMeas struct {
-	Up      bool
-	RTTus   uint32 // smoothed by the reporter, queueing taken out
-	LossPPM uint32
-	At      int64 // the receive time, monotonic ms; 0: none
+	At int64 // the receive time, monotonic ms; 0: none
 
 	// ProbeAt and ProbeRTTus are a round-trip observation with queueing,
 	// separate from the cost estimate. ProbeAt uses the same clock as
@@ -64,21 +61,24 @@ type LinkMeas struct {
 	// ProbeAt records a failed probe.
 	ProbeAt    int64
 	ProbeRTTus uint32
+	// QueueUs is the measured queueing delay (the congestion term).
+	QueueUs uint32
 	// Carrier names the transport the measurement used ("" unknown);
 	// diagnostics only, never a cost input.
 	Carrier string
-	// NoDatagram: that transport has no unreliable datagrams (realtime
-	// flows weigh its loss more, pathcost.RealtimeLossFactor).
-	NoDatagram bool
 	// RateOutBps / RateInBps are the reporter's available rate towards
 	// the peer / from it (bytes/s, 0 unknown).
 	RateOutBps, RateInBps uint64
-	// QueueUs is the measured queueing delay (the congestion term).
-	QueueUs uint32
 	// Uplink is the uplink of the peer the reporter dialled: the peer
 	// end's uplink; "" when the reporter accepted (or dialled the peer's
 	// default). The dialling end's own uplink is its default ("").
-	Uplink string
+	Uplink  string
+	RTTus   uint32 // smoothed by the reporter, queueing taken out
+	LossPPM uint32
+	Up      bool
+	// NoDatagram: that transport has no unreliable datagrams (realtime
+	// flows weigh its loss more, pathcost.RealtimeLossFactor).
+	NoDatagram bool
 }
 
 // LinkTable holds both ends' reports per edge: [0] from A, [1] from B.

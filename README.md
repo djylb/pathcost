@@ -38,7 +38,9 @@ path, concatenate its Links with the next segment and call pathcost.Path.
 Self demands and self loops yield no route.
 For recovery from an outage, pass comparable per-link round trips with
 `LinkMeas.ProbeRTTus` and `LinkMeas.ProbeAt` and recompute when they
-change. Each round needs a new observation for every hop on both paths.
+change. For example, a successful probe can be reported with
+`route.LinkMeas{Up: true, At: nowMS, ProbeAt: probeMS, ProbeRTTus: 4000}`.
+Each round needs a new observation for every hop on both paths.
 `PathSet.PreferFirst` carries the recovery decision to consumers that
 order candidates by flow class.
 
