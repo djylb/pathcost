@@ -34,3 +34,19 @@ func ExampleHysteresis() {
 	// false
 	// true
 }
+
+// BulkRateBps is the measured rate above which the caller treats the streams
+// opened after it as bulk. ClassOf maps that decision and the flow kind to a
+// class.
+func ExampleBulkRateBps() {
+	for _, rate := range []int64{64 << 10, pathcost.BulkRateBps} {
+		class := pathcost.ClassOf(false, rate >= pathcost.BulkRateBps)
+		fmt.Println(rate, class == pathcost.Bulk)
+	}
+	// Datagrams are realtime whatever the measured rate.
+	fmt.Println(pathcost.ClassOf(true, true) == pathcost.Realtime)
+	// Output:
+	// 65536 false
+	// 1048576 true
+	// true
+}
