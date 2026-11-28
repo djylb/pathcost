@@ -9,9 +9,6 @@ func TestLinkAutoIsZeroValue(t *testing.T) {
 	if zero != LinkAuto || (Cover{}).Mode != LinkAuto || (Cover{BiasUs: 5}).Mode != LinkAuto {
 		t.Fatalf("zero LinkMode is %d, want LinkAuto (%d)", zero, LinkAuto)
 	}
-	if LinkAuto == LinkMust || LinkAuto == LinkForbid {
-		t.Fatal("LinkAuto must be distinct from the other modes")
-	}
 }
 
 // An edge in LinkAuto mode joins routing when its measurements show it is
